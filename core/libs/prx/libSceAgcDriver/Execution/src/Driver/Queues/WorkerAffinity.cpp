@@ -2,6 +2,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include <cstdlib>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace AgcDriver::DriverDetail {
 
@@ -28,6 +31,16 @@ void PinWorkerThread(const char* role) {
         std::fprintf(stderr, "[affinity] queue workers and presenter -> 0x%llx (hybrid=%d efficient=0x%llx performant=0x%llx process=0x%llx)\n", static_cast<unsigned long long>(mask), layout.hybrid ? 1 : 0, static_cast<unsigned long long>(layout.efficient), static_cast<unsigned long long>(layout.performant), static_cast<unsigned long long>(layout.process));
     });
     CpuTopology::PinTraced(role, nullptr, mask);
+}
+
+void NameWorkerThread(const char* name) {
+#ifdef _WIN32
+    wchar_t wide[64]{};
+    for (std::size_t i = 0; i + 1 < sizeof(wide) / sizeof(wide[0]) && name[i] != '\0'; ++i) wide[i] = static_cast<wchar_t>(name[i]);
+    SetThreadDescription(GetCurrentThread(), wide);
+#else
+    (void)name;
+#endif
 }
 
 }

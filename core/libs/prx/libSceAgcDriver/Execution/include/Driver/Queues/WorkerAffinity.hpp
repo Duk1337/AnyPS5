@@ -9,6 +9,9 @@ std::uint64_t WorkerAffinityMask();
 
 void PinWorkerThread(const char* role);
 
+// A thread name (ASCII) the in-process sampler (APS5_SAMPLE_THREADS) and debuggers select the thread by.
+void NameWorkerThread(const char* name);
+
 }
 
 #endif

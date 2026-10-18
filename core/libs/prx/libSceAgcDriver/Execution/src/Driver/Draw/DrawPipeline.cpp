@@ -409,6 +409,7 @@ void DrawPipeline::pushItem(Item item) {
 }
 
 void DrawPipeline::prepRun() {
+    NameWorkerThread("AgcPrep");
     Active() = true;
     GuestMemory::SetCollectRole(2);
     for (;;) {
@@ -615,6 +616,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 }
 
 void DrawPipeline::run() {
+    NameWorkerThread("AgcCommitter");
     GuestMemory::SetCollectRole(1);
     static const auto holdBudget = [] {
         const char* text = std::getenv("APS5_COMMIT_HOLD_US");

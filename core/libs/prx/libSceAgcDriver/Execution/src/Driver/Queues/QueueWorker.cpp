@@ -119,6 +119,7 @@ void Driver::reapCompletionLabels() {
 
 void Driver::runCompletionThread() noexcept {
     PinWorkerThread("eop completion");
+    NameWorkerThread("AgcCompletion");
     try {
         std::uint64_t recorder = 0, serial = 0;
         while (Graphics::Recorder::WaitCompletionWork(recorder, serial)) {
@@ -141,6 +142,8 @@ void Driver::run(std::uint32_t id) noexcept {
         char role[32];
         std::snprintf(role, sizeof role, "queue worker 0x%x", id);
         PinWorkerThread(role);
+        std::snprintf(role, sizeof role, "AgcQueue 0x%x", id);
+        NameWorkerThread(role);
     }
 
     GuestMemory::TagGpuLockThread(id);
