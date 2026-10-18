@@ -10,8 +10,56 @@
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <cstdlib>
+#include <algorithm>
+#include <chrono>
+#include <map>
+#include <string>
+#include <mutex>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// APS5_CHAIN: where each queue's wall time goes (10 s windows): waiting for the guest's next
+// submission (idle), a submission waiting behind earlier ones (backlog), waiting for another
+// queue to release its order (order), and executing it. With the
+// [eop] lines this splits a frame into guest time, driver time and GPU completion time.
+struct ChainTotals {
+    std::uint64_t submissions = 0;
+    double idleMs = 0, backlogMs = 0, orderMs = 0, executeMs = 0, executeMaxMs = 0;
+};
+
+bool ChainEnabled() {
+    static const bool enabled = std::getenv("APS5_CHAIN") != nullptr;
+    return enabled;
+}
+
+void NoteChain(std::uint32_t queue, double idleMs, double backlogMs, double orderMs, double executeMs) {
+    static std::mutex mutex;
+    static std::map<std::uint32_t, ChainTotals> totals;
+    static auto last = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    auto& entry = totals[queue];
+    ++entry.submissions;
+    entry.idleMs += idleMs;
+    entry.backlogMs += backlogMs;
+    entry.orderMs += orderMs;
+    entry.executeMs += executeMs;
+    entry.executeMaxMs = std::max(entry.executeMaxMs, executeMs);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    std::string text = "[chain] 10 s:";
+    for (const auto& [id, value] : totals) {
+        char item[200];
+        std::snprintf(item, sizeof item, " queue 0x%x %llu subs idle %.0f ms backlog %.0f ms order %.0f ms execute %.0f ms (max %.1f);", id, static_cast<unsigned long long>(value.submissions), value.idleMs, value.backlogMs, value.orderMs, value.executeMs, value.executeMaxMs);
+        text += item;
+    }
+    std::fprintf(stderr, "%s\n", text.c_str());
+    totals.clear();
+}
+
+}
 
 FrameTiming* Driver::frameTiming() {
     if (!APS5_ENABLE_TIMING_LOG) return nullptr;
@@ -162,6 +210,8 @@ void Driver::run(std::uint32_t id) noexcept {
         for (;;) {
             submission = Submission{};
             static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
+            const auto chainWaitStart = std::chrono::steady_clock::now();
+            auto chainIdleMs = 0.0;
             {
                 PerformanceContext timingContext(id == 0 ? frameTiming() : FrameTiming::Async());
                 PerformanceTimer timing("Driver.WorkerWait");
@@ -200,6 +250,7 @@ void Driver::run(std::uint32_t id) noexcept {
                     lock.lock();
                 }
                 timing.Mark("idle_and_completion_poll");
+                if (ChainEnabled()) chainIdleMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - chainWaitStart).count();
                 rethrowFailure();
                 if (stopping || shutdownToken.stop_requested() || pending.empty()) {
                     break;
@@ -226,7 +277,13 @@ void Driver::run(std::uint32_t id) noexcept {
                     explicit Running(std::atomic<std::uint32_t>& count) : count(count) { count.fetch_add(1, std::memory_order_acq_rel); }
                     ~Running() { count.fetch_sub(1, std::memory_order_acq_rel); }
                 } running{runningWorkers};
+                const auto chainStart = std::chrono::steady_clock::now();
                 execute(submission);
+                if (ChainEnabled()) {
+                    const auto backlog = submission.enqueuedAt != std::chrono::steady_clock::time_point{} && submission.enqueuedAt < chainWaitStart ? std::chrono::duration<double, std::milli>(chainWaitStart - submission.enqueuedAt).count() : 0.0;
+                    const auto order = std::max(0.0, std::chrono::duration<double, std::milli>(chainStart - chainWaitStart).count() - chainIdleMs);
+                    NoteChain(id, chainIdleMs, backlog, order, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - chainStart).count());
+                }
             }
             if (traceGpu) AgcDriver::ProfilePrint_nid_no_patch("[gpu] %.1f done serial=%llu queue=0x%x\n", TraceMs(), static_cast<unsigned long long>(submission.serial), id);
             const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
