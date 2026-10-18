@@ -315,6 +315,18 @@ BdaResources::BucketStats BdaResources::TakeBucketCounters() {
     return stats;
 }
 
+void ClearFaultBuffers(VkDevice device) {
+    std::vector<std::unique_ptr<Buffer>> retired;
+    {
+        auto& pool = FaultBuffers();
+        std::lock_guard lock(pool.mutex);
+        if (pool.device != device) return;
+        retired.swap(pool.free);
+    }
+    // Buffer destruction returns allocations to BufferPool and may drop its last owner.
+    // Never run those callbacks while holding the fault-pool mutex.
+}
+
 BdaResources::BdaResources(const Context& context) : device(context.device) {
     static_assert(std::endian::native == std::endian::little);
     Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
