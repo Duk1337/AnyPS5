@@ -964,10 +964,11 @@ bool ProcTable() {
 std::mutex labelTableMutex;
 Recorder* labelTableOwner = nullptr;
 // APS5_ASYNC_QUEUES: a routed queue worker's label work (groups, queued labels) goes into the async
-// recorder's own table, where its recorded stores are (noteLabelOn); lookups consult this thread's
-// table first and the other recorder's after it.
+// recorder's own table, where its recorded stores are (noteLabelOn). Lookups consult this thread's
+// table ONLY: a label found recorded in a batch is trusted because work recorded after it on the same
+// Vulkan queue runs after it. A label recorded on the other recorder's queue carries no such order, so
+// a wait on it falls back to guest memory, which the store reaches only once its batch has executed.
 Recorder* ThreadLabelTable() { return routedAsync && asyncRecorder != nullptr ? asyncRecorder : labelTableOwner; }
-Recorder* OtherLabelTable() { return routedAsync && asyncRecorder != nullptr ? labelTableOwner : asyncRecorder; }
 // The ranges of the calling worker's queued labels (NoteQueuedLabel, cleared by
 // ForgetQueuedLabels): the flush hook, on the same thread, has them recorded before an access that
 // overlaps one, through the function the driver installed.
@@ -1757,19 +1758,15 @@ void Recorder::Activate() {
 
 std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) {
     std::lock_guard tableLock(labelTableMutex);
-    for (Recorder* table : {ThreadLabelTable(), OtherLabelTable()}) {
-        if (table == nullptr) continue;
-        if (auto hit = table->lookupLabel(address, bytes, afterStamp, refusal)) return hit;
-    }
-    return std::nullopt;
+    Recorder* const table = ThreadLabelTable();
+    if (table == nullptr) return std::nullopt;
+    return table->lookupLabel(address, bytes, afterStamp, refusal);
 }
 
 bool Recorder::WideLabelIn(std::uint64_t address, std::size_t bytes) {
     std::lock_guard tableLock(labelTableMutex);
-    for (Recorder* table : {ThreadLabelTable(), OtherLabelTable()}) {
-        if (table != nullptr && table->wideLabelInLocked(address, bytes)) return true;
-    }
-    return false;
+    Recorder* const table = ThreadLabelTable();
+    return table != nullptr && table->wideLabelInLocked(address, bytes);
 }
 
 bool Recorder::wideLabelInLocked(std::uint64_t address, std::size_t bytes) const {
@@ -1784,7 +1781,7 @@ bool Recorder::wideLabelInLocked(std::uint64_t address, std::size_t bytes) const
 bool Recorder::CurrentLabelDword(std::uint64_t address, std::uint32_t& value) {
     if (address % 4 != 0) return false;
     std::lock_guard tableLock(labelTableMutex);
-    for (Recorder* owner : {ThreadLabelTable(), OtherLabelTable()}) {
+    for (Recorder* owner : {ThreadLabelTable()}) {
         if (owner == nullptr) continue;
         const auto& table = owner->labels;
         const auto found = table.find(address);
