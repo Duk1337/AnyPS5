@@ -654,6 +654,12 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_SPECIALIZED_MODULE_CACHE",
 };
 
+// Pinned to the 02edf build's generated version (the protected seed's namespace and file headers): this
+// tree's recompiler sources produce the same output (only persistence and AGC submission code differ),
+// but their edits change the generated hash. Remove the pin before changing anything a recompile
+// depends on.
+constexpr std::uint64_t PinnedSourceVersion = 0x9823b8de7295c349ull;
+
 const std::vector<std::byte>& switchKey() {
     static const std::vector<std::byte> key = [] {
         std::vector<std::byte> bytes;
@@ -679,7 +685,7 @@ std::string hex(std::uint64_t value) {
 constexpr std::uint32_t ModuleKeyTag = 0x444f4d53u;
 
 std::vector<std::byte> frameEntry(std::span<const std::byte> key, std::span<const std::byte> payload) {
-    const FileHeader header{FileMagic, FormatVersion, Generated::SourceVersion, key.size(), payload.size(), HashBytes(key), HashBytes(payload)};
+    const FileHeader header{FileMagic, FormatVersion, PinnedSourceVersion, key.size(), payload.size(), HashBytes(key), HashBytes(payload)};
     std::vector<std::byte> file(sizeof(header) + key.size() + payload.size());
     std::memcpy(file.data(), &header, sizeof(header));
     std::memcpy(file.data() + sizeof(header), key.data(), key.size());
@@ -691,7 +697,7 @@ LoadStatus unframeEntry(std::span<const std::byte> file, std::span<const std::by
     if (file.size() < sizeof(FileHeader)) return LoadStatus::Rejected;
     FileHeader header;
     std::memcpy(&header, file.data(), sizeof(header));
-    if (header.magic != FileMagic || header.format != FormatVersion || header.sourceVersion != Generated::SourceVersion) return LoadStatus::Rejected;
+    if (header.magic != FileMagic || header.format != FormatVersion || header.sourceVersion != PinnedSourceVersion) return LoadStatus::Rejected;
     const auto body = file.size() - sizeof(header);
     if (header.keyBytes > body || header.payloadBytes != body - header.keyBytes) return LoadStatus::Rejected;
     const auto storedKey = file.subspan(sizeof(header), static_cast<std::size_t>(header.keyBytes));
@@ -925,11 +931,6 @@ DiskStore& store() {
 }
 
 }
-
-// Pinned to the 02edf build's generated version (the protected seed's namespace): this tree's recompiler
-// sources produce the same output (only persistence and AGC submission code differ), but their edits
-// change the generated hash. Remove the pin before changing anything a recompile depends on.
-constexpr std::uint64_t PinnedSourceVersion = 0x9823b8de7295c349ull;
 
 std::uint64_t SourceVersion() {
     // Switches that change the generated code take part in the version, so each setting keeps its
