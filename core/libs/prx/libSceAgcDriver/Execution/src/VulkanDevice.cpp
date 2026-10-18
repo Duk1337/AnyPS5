@@ -255,6 +255,8 @@ struct VulkanDevice::State {
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
+    // APS5_ASYNC_QUEUES: the second queue of `family`, used only by asyncRecorder.
+    VkQueue asyncQueue = VK_NULL_HANDLE;
     VkCommandPool pool = VK_NULL_HANDLE;
     void* window = nullptr;
     // The queue family of `queue`, and whether a headless device was made able to take a window later
@@ -332,6 +334,14 @@ struct VulkanDevice::State {
     bool contextReady = false;
     std::unique_ptr<Graphics::TextureDetiler> detiler;
     std::unique_ptr<Graphics::Recorder> recorder;
+    // APS5_ASYNC_QUEUES: the recorder of the listed guest queues' workers, on asyncQueue.
+    std::unique_ptr<Graphics::Recorder> asyncRecorder;
+    // The recorder the calling thread records into: the async one for a routed queue worker
+    // (Recorder::RouteThisThread), the main one for every other thread.
+    Graphics::Recorder* routed() const {
+        auto* active = Graphics::Recorder::Active();
+        return asyncRecorder != nullptr && active == asyncRecorder.get() ? asyncRecorder.get() : recorder.get();
+    }
     // Device-local buffers of a repeated 16-byte fill pattern (FillBuffer), most recently used
     // last; each is filled once by a doubling chain in device memory.
     std::vector<std::pair<std::array<std::uint32_t, 4>, std::shared_ptr<Graphics::DeviceBuffer>>> patternBuffers;
@@ -601,6 +611,16 @@ struct VulkanDevice::State {
             for (auto& slot : presentSlots) {
                 slot.dumpBuffer.reset();
                 slot.dumpScaler.reset();
+            }
+            // The async recorder's batches finish (and free what they kept) before the main
+            // recorder's teardown and the shadows' destruction.
+            if (asyncRecorder) {
+                try {
+                    asyncRecorder->Sync();
+                } catch (const std::exception& error) {
+                    std::fprintf(stderr, "[gpu] async recorder teardown: %s\n", error.what());
+                }
+                asyncRecorder.reset();
             }
             // Results still in the unit shadows reach guest memory before the device goes; the
             // slabs (kept by the publishing batch) are freed by the recorder's teardown.
@@ -1081,10 +1101,23 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         state->spirvExtensions.push_back("SPV_EXT_mesh_shader");
     }
     const float priority = 1.0f;
+    // APS5_ASYNC_QUEUES: a second queue of the same family for the async recorder (same family, so no
+    // queue family ownership transfers; each recorder submits only to its own queue).
+    const float priorities[2] = {1.0f, 1.0f};
+    bool asyncQueue = false;
+    if (Graphics::Recorder::AsyncQueuesRequested()) {
+        std::uint32_t count = 0;
+        auto getFamilies = state->InstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
+        getFamilies(selected, &count, nullptr);
+        std::vector<VkQueueFamilyProperties> families(count);
+        getFamilies(selected, &count, families.data());
+        asyncQueue = family < count && families[family].queueCount >= 2;
+        if (!asyncQueue) std::fprintf(stderr, "[async-queue] APS5_ASYNC_QUEUES ignored: queue family %u has one queue\n", family);
+    }
     VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queueInfo.queueFamilyIndex = family;
-    queueInfo.queueCount = 1;
-    queueInfo.pQueuePriorities = &priority;
+    queueInfo.queueCount = asyncQueue ? 2 : 1;
+    queueInfo.pQueuePriorities = asyncQueue ? priorities : &priority;
     VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
@@ -1373,6 +1406,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     }
     state->shaderProfile = std::move(shaderProfile);
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
+    if (asyncQueue) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 1, &state->asyncQueue);
     Graphics::NvPerf::Initialize(state->instance, selected, state->device, state->queue, family, state->instanceProc, state->deviceProc);
     faultQueue = state->queue;
     faultDeviceProc = state->deviceProc;
@@ -1397,6 +1431,14 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     state->samplerCache = std::make_unique<Graphics::SamplerCache>();
     state->recorder = std::make_unique<Graphics::Recorder>(graphicsContext(), state->timelineSemaphores);
     state->recorder->Activate();
+    if (state->asyncQueue != VK_NULL_HANDLE) {
+        // Its own command buffers, fences and timeline; only its submits go to the second queue.
+        auto asyncContext = graphicsContext();
+        asyncContext.queue = state->asyncQueue;
+        state->asyncRecorder = std::make_unique<Graphics::Recorder>(asyncContext, state->timelineSemaphores);
+        state->asyncRecorder->ActivateAsync();
+        std::fprintf(stderr, "[async-queue] second recorder on queue %p (family %u index 1) for guest queues %s\n", reinterpret_cast<void*>(state->asyncQueue), family, std::getenv("APS5_ASYNC_QUEUES"));
+    }
     state->context = buildContext();
     state->contextReady = true;
     if (window != nullptr) setupPresentation(*window);
@@ -1518,6 +1560,8 @@ void VulkanDevice::WaitIdle() {
         if (!state->recorder->Idle()) Graphics::Recorder::CountSync(0, __builtin_return_address(0));
         state->recorder->Sync();
     }
+    // Idle means both queues: the async recorder's completions (write-backs) run here too.
+    if (state->asyncRecorder) state->asyncRecorder->Sync();
     check(state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device), "vkDeviceWaitIdle");
     APS5_LOG_CHARS_OUT_DEBUG("VulkanDevice::WaitIdle complete");
 }
@@ -1532,54 +1576,54 @@ bool OpportunisticReap() {
 }
 
 void VulkanDevice::SubmitRecorded(bool reapFirst) {
-    if (!state->recorder) return;
+    if (!state->routed()) return;
     // Finished batches are retired first (a non-blocking fence status check on the front of the
     // in-flight list), so PendingWriteOverlaps/HasCompletions scans stay short and a label recorded
     // after a completing batch already finished can go to the GPU instead of behind a completion.
     // Not for cross-queue submitters: a retired batch's write-back may sync a later batch under the
     // mutex (see the header), which a poller or compute worker must never do for queue 0.
-    if (reapFirst && OpportunisticReap()) state->recorder->Reap();
-    state->recorder->Submit();
+    if (reapFirst && OpportunisticReap()) state->routed()->Reap();
+    state->routed()->Submit();
 }
 
 bool VulkanDevice::CanWaitUnlocked() const {
-    return state->recorder && state->recorder->HasTimeline();
+    return state->routed() && state->routed()->HasTimeline();
 }
 
 std::uint64_t VulkanDevice::SubmitAndEpoch() {
-    if (!state->recorder) return 0;
-    if (OpportunisticReap()) state->recorder->Reap();
-    return state->recorder->SubmitAndEpoch();
+    if (!state->routed()) return 0;
+    if (OpportunisticReap()) state->routed()->Reap();
+    return state->routed()->SubmitAndEpoch();
 }
 
 void VulkanDevice::WaitRecorded(std::uint64_t serial) {
-    if (state->recorder) state->recorder->WaitSerial(serial);
+    if (state->routed()) state->routed()->WaitSerial(serial);
 }
 
 void VulkanDevice::ReapRecorded(std::uint64_t serial) {
-    if (!state->recorder) return;
+    if (!state->routed()) return;
     // The drain's site in the [recorder] table is this call's caller (Driver::execute's drain,
     // PrepareDispatch's presync), not this wrapper; FinishUpTo consumes the announcement.
     Graphics::Recorder::AnnounceSyncSite(__builtin_return_address(0));
-    state->recorder->FinishUpTo(serial);
+    state->routed()->FinishUpTo(serial);
 }
 
 void VulkanDevice::ReapRecorded() {
-    if (state->recorder) state->recorder->Reap();
+    if (state->routed()) state->routed()->Reap();
 }
 
 std::optional<Graphics::Recorder::LabelHit> VulkanDevice::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, Graphics::Recorder::LabelRefusal* refusal) const {
-    if (!state->recorder) return std::nullopt;
-    return state->recorder->PendingLabel(address, bytes, afterStamp, refusal);
+    if (!state->routed()) return std::nullopt;
+    return state->routed()->PendingLabel(address, bytes, afterStamp, refusal);
 }
 
 bool VulkanDevice::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
-    return state->recorder && state->recorder->OpenWriteOverlaps(address, bytes);
+    return state->routed() && state->routed()->OpenWriteOverlaps(address, bytes);
 }
 
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
-    if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
-    auto& recorder = *state->recorder;
+    if (!state->routed() || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
+    auto& recorder = *state->routed();
     // Batches that already finished are retired before the checks: their completions ran, so they
     // neither keep the recorder busy nor force this label behind a completion. Only for the
     // graphics worker: a reap runs completions (copied write-backs, whose guest stores can re-enter
@@ -1646,14 +1690,14 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
 }
 
 bool VulkanDevice::AfterRecordedWork(std::function<void()> action, bool reapFirst) {
-    if (!state->recorder) return false;
-    if (reapFirst && OpportunisticReap()) state->recorder->Reap();
-    return state->recorder->AfterRecordedWork(std::move(action));
+    if (!state->routed()) return false;
+    if (reapFirst && OpportunisticReap()) state->routed()->Reap();
+    return state->routed()->AfterRecordedWork(std::move(action));
 }
 
 bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
-    if (!state->recorder) return false;
-    auto& recorder = *state->recorder;
+    if (!state->routed()) return false;
+    auto& recorder = *state->routed();
     constexpr std::size_t bytes = 15 * 16 + 8;
     if (OpportunisticReap()) recorder.Reap();
     if (state->CopiedWriterOverlaps(address, bytes) || (Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.CompletionLabelIn(address, bytes))) return false;
@@ -1671,8 +1715,8 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
 }
 
 bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern) {
-    if (!state->recorder || bytes == 0 || bytes % 16 != 0 || address % 16 != 0) return false;
-    auto& recorder = *state->recorder;
+    if (!state->routed() || bytes == 0 || bytes % 16 != 0 || address % 16 != 0) return false;
+    auto& recorder = *state->routed();
     // Finished batches are retired first (one fence status check, as WriteLabelOnGpu does): their
     // completion labels landed and their copied writers are delisted, so a batch the idle GPU already
     // finished does not force a wait below. Before the import lookup: a completion may refresh the
@@ -1910,8 +1954,8 @@ VulkanDevice::CopyAliasing VulkanDevice::CopyAliasCounts() {
 
 VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, std::uint64_t source, std::size_t bytes, std::size_t cpuMax, std::size_t gpuMax, std::size_t knownMax, std::uint64_t programAddress, std::uint32_t queue, const CopyWriterNote& noteWriter) {
     CopyOutcome outcome{2, false, 0, CopyOutcome::None, false, false, 0, 0, 0, 0, false};
-    if (!state->recorder || bytes == 0) return outcome;
-    auto& recorder = *state->recorder;
+    if (!state->routed() || bytes == 0) return outcome;
+    auto& recorder = *state->routed();
     // Finished batches were retired by the caller (Driver.cpp copyBuffer, on the graphics worker
     // only, as WriteLabelOnGpu reaps), so their writes neither refuse the CPU copy nor force a wait.
     static const bool alwaysSync = std::getenv("APS5_COPY_SYNC") != nullptr;
@@ -3413,15 +3457,15 @@ std::uint64_t VulkanDevice::presync(std::span<const std::pair<std::uint64_t, std
         // No reap here (SubmitAndEpoch's would run completions, which a compute worker must not do
         // on queue 0's behalf, see SubmitRecorded): the dispatch reaps after the wait.
         std::lock_guard lock(GuestMemory::GpuMutex());
-        if (state->recorder) {
+        if (state->routed()) {
             bool open = false;
             for (const auto& [address, bytes] : surfaces) {
-                const auto info = state->recorder->DescribePendingWrite(address, static_cast<std::size_t>(bytes));
+                const auto info = state->routed()->DescribePendingWrite(address, static_cast<std::size_t>(bytes));
                 if (!info.has_value()) continue;
                 open = open || info->open;
                 serial = std::max(serial, info->serial);
             }
-            if (open) serial = state->recorder->SubmitAndEpoch();
+            if (open) serial = state->routed()->SubmitAndEpoch();
         }
     }
     if (serial != 0) {
@@ -3551,7 +3595,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompi
 }
 
 void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& outcome, char* groupsText) {
-    auto& recorder = *state->recorder;
+    auto& recorder = *state->routed();
     auto& timer = *record.timer;
     const auto& context = *record.context;
     const auto arguments = record.arguments;
@@ -3638,7 +3682,7 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
 void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     CpuCost::Scope diagCost(CpuCost::Op::ComputeRecord);
     auto& d = Dispatches();
-    auto& recorder = *state->recorder;
+    auto& recorder = *state->routed();
     auto& timer = *record.timer;
     const auto& context = *record.context;
     auto& resources = *record.resources;
@@ -3892,7 +3936,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         static const bool deferEviction = std::getenv("APS5_NO_DEFERRED_EVICTION") == nullptr;
         std::vector<std::shared_ptr<Graphics::ShaderResources>> evicted;
         state->resourceCache.Insert(contentKey, resources, deferEviction ? &evicted : nullptr);
-        for (auto& object : evicted) state->recorder->Keep(std::move(object));
+        for (auto& object : evicted) state->routed()->Keep(std::move(object));
         if (profile) {
             timer.add(PhaseResourcesInsert, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - insertStart).count());
             if (arguments != 0) d.indirectHold.phaseCounts[PhaseResourcesInsert] += evicted.size();
@@ -3947,7 +3991,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                 state->resourceCache.Remove(contentKey, cached.get());
                 ++d.cacheInvalidated;
                 // Off the mutex with its batch, as an evicted entry (insert()).
-                state->recorder->Keep(std::move(cached));
+                state->routed()->Keep(std::move(cached));
             }
             if (profile) {
                 revalidateMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - subPhaseStart).count();
@@ -4036,7 +4080,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     }
     // Recorded into the device's open batch: the CPU moves on to the next command while the GPU
     // works; the batch is waited for where the guest expects results (labels, flips, CPU reads).
-    auto& recorder = *state->recorder;
+    auto& recorder = *state->routed();
     IndirectOutcome outcome{0, 0};
     RecordedDispatch record{&context, &shaders[0], resources, objects, pushStages, &pushBytes, x, y, z, arguments, nullptr, programAddress, fromCache && TemplateDataRefresh() ? RecordedDispatch::DataRefresh::Words : RecordedDispatch::DataRefresh::None, 0, revalidateMs, &timer};
     record.resourceKeyMatched = fromCache;
@@ -4162,7 +4206,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         // ordinary path runs with the prepared find (C10: the template goes to the batch).
         if (verify->cached.get() != hit->resources.get()) {
             counters.verifyReplaced.fetch_add(1, std::memory_order_relaxed);
-            state->recorder->Keep(std::move(hit->resources));
+            state->routed()->Keep(std::move(hit->resources));
             return RecipeOutcome::Rebuild;
         }
         std::shared_ptr<ComputePipelineObjects> mapped;
@@ -4198,7 +4242,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         state->resourceCache.Remove(recipe.key, hit->resources.get());
         ++d.cacheInvalidated;
         // Off the mutex with its batch, as an evicted entry.
-        state->recorder->Keep(std::move(hit->resources));
+        state->routed()->Keep(std::move(hit->resources));
         counters.rebuilds[static_cast<std::size_t>(report.failure)].fetch_add(1, std::memory_order_relaxed);
         return RecipeOutcome::Rebuild;
     }
@@ -4224,7 +4268,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     APS5_LOG_OUT_DEBUG("Dispatch recorded from recipe groups=%s", groupsText);
     if (SyncEachDispatch()) {
         Graphics::Recorder::CountSync(3);
-        state->recorder->Sync();
+        state->routed()->Sync();
         timer.phase(PhaseSync);
     }
     if (TraceDispatchIo()) std::fprintf(stderr, "[dispatch-io] %s:%s\n", groupsText, hit->resources->Describe().c_str());

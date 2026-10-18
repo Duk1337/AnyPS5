@@ -144,6 +144,13 @@ void Driver::run(std::uint32_t id) noexcept {
     }
 
     GuestMemory::TagGpuLockThread(id);
+    // APS5_ASYNC_QUEUES: this queue's work records into the second recorder (its own Vulkan queue), so
+    // its batches and completion signals no longer wait behind the graphics queue's batches. Without
+    // a second recorder (one-queue family, or the switch absent) Active() stays the main recorder.
+    if (id != 0 && Graphics::Recorder::AsyncQueueListed(id)) {
+        Graphics::Recorder::RouteThisThread(true);
+        std::fprintf(stderr, "[async-queue] queue 0x%x worker routed to the async recorder (%s)\n", id, Graphics::Recorder::Async() != nullptr ? "active" : "not created: main recorder");
+    }
     if (id == 0) StartWorkerSampler();
     Submission submission;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

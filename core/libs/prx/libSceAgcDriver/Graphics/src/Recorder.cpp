@@ -382,6 +382,15 @@ void refreshPerformanceControls() {
 }
 
 Recorder* activeRecorder = nullptr;
+// APS5_ASYNC_QUEUES: a second recorder on its own Vulkan queue (VulkanDevice). The queue workers of the
+// listed guest queues are routed to it (RouteThisThread) and see it as Active(); every other thread
+// keeps activeRecorder. Slot 0 is activeRecorder, slot 1 asyncRecorder.
+Recorder* asyncRecorder = nullptr;
+thread_local bool routedAsync = false;
+
+int SlotOf(const Recorder* recorder) { return recorder != nullptr && recorder == asyncRecorder ? 1 : 0; }
+int CurrentSlot() { return routedAsync && asyncRecorder != nullptr ? 1 : 0; }
+bool Registered(const Recorder* recorder) { return recorder != nullptr && (recorder == activeRecorder || recorder == asyncRecorder); }
 
 bool DrawProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -843,7 +852,8 @@ void ReleaseDeferredKeeps() {
 // Lock-free state of the active recorder's open batch, read by the queue workers between packets
 // and inside WAIT_REG_MEM polls (see the static readers in Recorder.hpp). Written under the mutex.
 constexpr std::int64_t NoPendingLabel = std::numeric_limits<std::int64_t>::min();
-std::atomic<std::int64_t> pendingLabelSince{NoPendingLabel};
+// Per recorder slot (SlotOf): each recorder's open batch has its own pending label.
+std::atomic<std::int64_t> pendingLabelSince[2] = {NoPendingLabel, NoPendingLabel};
 std::atomic<std::uint64_t> writeGeneration{0};
 std::atomic<std::uint64_t> publishGeneration{0};
 std::atomic<std::uint64_t> completionLabels{0};
@@ -931,7 +941,8 @@ void NoteCompletionDelivered(std::uint64_t recorder, std::uint64_t serial, std::
     ++(onCompletionThread ? stats.byThread : stats.byOthers);
     if (now - stats.lastReport >= std::chrono::seconds(10)) ReportCompletionDeliveries(stats, now);
 }
-std::atomic<std::uint64_t> workSinceSubmit{0};
+// Per recorder slot (SlotOf), like pendingLabelSince.
+std::atomic<std::uint64_t> workSinceSubmit[2] = {0, 0};
 
 // APS5_COUNT_ALL_COMPLETION_LABELS=1: a completion label also stored on the GPU counts as pending
 // from its registration, as before (see Recorder::AfterCompletions).
@@ -952,6 +963,11 @@ bool ProcTable() {
 // under this mutex takes the GPU mutex (no lock-order cycle).
 std::mutex labelTableMutex;
 Recorder* labelTableOwner = nullptr;
+// APS5_ASYNC_QUEUES: a routed queue worker's label work (groups, queued labels) goes into the async
+// recorder's own table, where its recorded stores are (noteLabelOn); lookups consult this thread's
+// table first and the other recorder's after it.
+Recorder* ThreadLabelTable() { return routedAsync && asyncRecorder != nullptr ? asyncRecorder : labelTableOwner; }
+Recorder* OtherLabelTable() { return routedAsync && asyncRecorder != nullptr ? labelTableOwner : asyncRecorder; }
 // The ranges of the calling worker's queued labels (NoteQueuedLabel, cleared by
 // ForgetQueuedLabels): the flush hook, on the same thread, has them recorded before an access that
 // overlaps one, through the function the driver installed.
@@ -1051,6 +1067,27 @@ using WriteRanges = Recorder::WriteRanges;
 // reader that sees no overlap either precedes the note (the queues are unordered then, as on the
 // GPU) or follows the write-back.
 std::atomic<std::shared_ptr<const WriteRanges>> pendingWrites;
+// Each registered recorder's own merged ranges (SlotOf); pendingWrites is their union, so every reader
+// of the snapshot sees both recorders' unfinished writes. With one recorder the union is slot 0 itself.
+std::atomic<std::shared_ptr<const WriteRanges>> ownPendingWrites[2];
+
+// Publishes the union of both slots as pendingWrites (under the GpuMutex, like every publish).
+void PublishPendingUnion() {
+    auto main = ownPendingWrites[0].load(std::memory_order_acquire);
+    auto async = ownPendingWrites[1].load(std::memory_order_acquire);
+    if (async == nullptr || async->empty()) { pendingWrites.store(std::move(main), std::memory_order_release); return; }
+    if (main == nullptr || main->empty()) { pendingWrites.store(std::move(async), std::memory_order_release); return; }
+    auto merged = std::make_shared<WriteRanges>(*main);
+    merged->insert(merged->end(), async->begin(), async->end());
+    std::sort(merged->begin(), merged->end());
+    std::size_t out = 0;
+    for (const auto& [begin, end] : *merged) {
+        if (out != 0 && begin <= (*merged)[out - 1].second) (*merged)[out - 1].second = std::max((*merged)[out - 1].second, end);
+        else (*merged)[out++] = {begin, end};
+    }
+    merged->resize(out);
+    pendingWrites.store(std::move(merged), std::memory_order_release);
+}
 
 bool HookSnapshotEnabled() {
     // Debug aid: APS5_NO_HOOK_SNAPSHOT=1 takes the GpuMutex on every access as before.
@@ -1071,9 +1108,9 @@ bool SnapshotOverlaps(std::uint64_t address, std::size_t bytes) {
     return SnapshotOverlaps(snapshot.get(), address, bytes);
 }
 
-// Whether one merged range of the snapshot contains [address, end) entirely.
-bool SnapshotCovers(std::uint64_t address, std::uint64_t end) {
-    const auto snapshot = pendingWrites.load(std::memory_order_acquire);
+// Whether one merged range of the recorder's own snapshot (slot) contains [address, end) entirely.
+bool SnapshotCovers(std::uint64_t address, std::uint64_t end, int slot = 0) {
+    const auto snapshot = ownPendingWrites[slot].load(std::memory_order_acquire);
     if (snapshot == nullptr || snapshot->empty()) return false;
     const auto it = std::partition_point(snapshot->begin(), snapshot->end(), [&](const auto& range) { return range.second <= address; });
     return it != snapshot->end() && it->first <= address && end <= it->second;
@@ -1449,7 +1486,11 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         hookLocks.fetch_add(1, std::memory_order_relaxed);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(GuestMemory::GpuMutex());
-        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, bytes)) {
+        // Both recorders' unfinished writes (APS5_ASYNC_QUEUES): each is re-read after the other's
+        // wait, which may have released the mutex.
+        for (int slot = 0; slot < 2; ++slot) {
+            auto* recorder = slot == 0 ? activeRecorder : asyncRecorder;
+            if (recorder == nullptr || !recorder->PendingWriteOverlaps(address, bytes)) continue;
             const HookSyncScope attribution(*recorder, address, bytes);
             Recorder::CountSync(1);
             // The wait runs without the mutex when this acquisition is the outermost one (a stage-A
@@ -1551,14 +1592,25 @@ Recorder::~Recorder() {
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
     }
+    if (asyncRecorder == this) {
+        // The async recorder goes first (VulkanDevice tears it down before the main one); its share of
+        // the snapshot and of the counters leaves with it.
+        asyncRecorder = nullptr;
+        ownPendingWrites[1].store(nullptr, std::memory_order_release);
+        PublishPendingUnion();
+        publishGeneration.fetch_add(1, std::memory_order_release);
+        pendingLabelSince[1].store(NoPendingLabel, std::memory_order_release);
+        workSinceSubmit[1].store(0, std::memory_order_release);
+    }
     if (activeRecorder == this) {
         activeRecorder = nullptr;
+        ownPendingWrites[0].store(nullptr, std::memory_order_release);
         pendingWrites.store(nullptr, std::memory_order_release);
         publishGeneration.fetch_add(1, std::memory_order_release);
-        pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+        pendingLabelSince[0].store(NoPendingLabel, std::memory_order_release);
         completionLabels.store(0, std::memory_order_release);
         writeBackCompletions.store(0, std::memory_order_release);
-        workSinceSubmit.store(0, std::memory_order_release);
+        workSinceSubmit[0].store(0, std::memory_order_release);
     }
     {
         // A thread that released the mutex around a wait on this recorder re-checks the id when it
@@ -1614,7 +1666,7 @@ Recorder::~Recorder() {
 }
 
 std::optional<std::chrono::steady_clock::time_point> Recorder::PendingLabelSince() {
-    const auto since = pendingLabelSince.load(std::memory_order_acquire);
+    const auto since = pendingLabelSince[CurrentSlot()].load(std::memory_order_acquire);
     if (since == NoPendingLabel) return std::nullopt;
     return std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(since));
 }
@@ -1636,15 +1688,62 @@ std::uint64_t Recorder::PendingWriteBackCompletions() {
 }
 
 std::uint64_t Recorder::RecordedWorkSinceSubmit() {
-    return workSinceSubmit.load(std::memory_order_relaxed);
+    return workSinceSubmit[CurrentSlot()].load(std::memory_order_relaxed);
 }
 
 void Recorder::CountRecordedWork() {
-    workSinceSubmit.fetch_add(1, std::memory_order_relaxed);
+    workSinceSubmit[CurrentSlot()].fetch_add(1, std::memory_order_relaxed);
 }
 
 Recorder* Recorder::Active() {
-    return activeRecorder;
+    return routedAsync && asyncRecorder != nullptr ? asyncRecorder : activeRecorder;
+}
+
+Recorder* Recorder::Async() {
+    return asyncRecorder;
+}
+
+void Recorder::ActivateAsync() {
+    asyncRecorder = this;
+}
+
+void Recorder::RouteThisThread(bool async) {
+    routedAsync = async;
+}
+
+namespace {
+// APS5_ASYNC_QUEUES=<id>[,<id>...] (hex 0x.. or decimal guest queue ids). Queue 0 never moves: the draw
+// pipeline, presentation and every graphics path record into the main recorder.
+const std::vector<std::uint32_t>& AsyncQueueList() {
+    static const std::vector<std::uint32_t> list = [] {
+        std::vector<std::uint32_t> ids;
+        const char* text = std::getenv("APS5_ASYNC_QUEUES");
+        if (text == nullptr) return ids;
+        const std::string value(text);
+        std::size_t position = 0;
+        while (position <= value.size()) {
+            const auto comma = value.find(',', position);
+            const auto item = value.substr(position, comma == std::string::npos ? std::string::npos : comma - position);
+            char* end = nullptr;
+            const auto id = std::strtoul(item.c_str(), &end, 0);
+            if (!item.empty() && end != nullptr && *end == '\0' && id != 0 && id <= 0xffff) ids.push_back(static_cast<std::uint32_t>(id));
+            else if (!item.empty()) std::fprintf(stderr, "[async-queue] APS5_ASYNC_QUEUES: ignoring '%s'\n", item.c_str());
+            if (comma == std::string::npos) break;
+            position = comma + 1;
+        }
+        return ids;
+    }();
+    return list;
+}
+}
+
+bool Recorder::AsyncQueuesRequested() {
+    return !AsyncQueueList().empty();
+}
+
+bool Recorder::AsyncQueueListed(std::uint32_t queue) {
+    const auto& list = AsyncQueueList();
+    return std::find(list.begin(), list.end(), queue) != list.end();
 }
 
 void Recorder::Activate() {
@@ -1658,13 +1757,19 @@ void Recorder::Activate() {
 
 std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) {
     std::lock_guard tableLock(labelTableMutex);
-    if (labelTableOwner == nullptr) return std::nullopt;
-    return labelTableOwner->lookupLabel(address, bytes, afterStamp, refusal);
+    for (Recorder* table : {ThreadLabelTable(), OtherLabelTable()}) {
+        if (table == nullptr) continue;
+        if (auto hit = table->lookupLabel(address, bytes, afterStamp, refusal)) return hit;
+    }
+    return std::nullopt;
 }
 
 bool Recorder::WideLabelIn(std::uint64_t address, std::size_t bytes) {
     std::lock_guard tableLock(labelTableMutex);
-    return labelTableOwner != nullptr && labelTableOwner->wideLabelInLocked(address, bytes);
+    for (Recorder* table : {ThreadLabelTable(), OtherLabelTable()}) {
+        if (table != nullptr && table->wideLabelInLocked(address, bytes)) return true;
+    }
+    return false;
 }
 
 bool Recorder::wideLabelInLocked(std::uint64_t address, std::size_t bytes) const {
@@ -1679,15 +1784,18 @@ bool Recorder::wideLabelInLocked(std::uint64_t address, std::size_t bytes) const
 bool Recorder::CurrentLabelDword(std::uint64_t address, std::uint32_t& value) {
     if (address % 4 != 0) return false;
     std::lock_guard tableLock(labelTableMutex);
-    if (labelTableOwner == nullptr) return false;
-    const auto& table = labelTableOwner->labels;
-    const auto found = table.find(address);
-    if (found == table.end()) return false;
-    const auto& entry = found->second;
-    if (entry.batch == nullptr || entry.overwritten || entry.behindCompletion) return false;
-    if (labelTableOwner->wideLabelInLocked(address, 4)) return false;
-    value = entry.value;
-    return true;
+    for (Recorder* owner : {ThreadLabelTable(), OtherLabelTable()}) {
+        if (owner == nullptr) continue;
+        const auto& table = owner->labels;
+        const auto found = table.find(address);
+        if (found == table.end()) continue;
+        const auto& entry = found->second;
+        if (entry.batch == nullptr || entry.overwritten || entry.behindCompletion) return false;
+        if (owner->wideLabelInLocked(address, 4)) return false;
+        value = entry.value;
+        return true;
+    }
+    return false;
 }
 
 std::optional<std::uint64_t> Recorder::LookupLabelValue(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp) {
@@ -1710,8 +1818,9 @@ void Recorder::CloseLabelGroup(std::uint64_t trackerGeneration) {
     LabelGroupDwords().clear();
     if (trackerGeneration == 0) return;
     std::lock_guard tableLock(labelTableMutex);
-    if (labelTableOwner == nullptr) return;
-    auto& recorded = labelTableOwner->labels;
+    Recorder* const owner = ThreadLabelTable();
+    if (owner == nullptr) return;
+    auto& recorded = owner->labels;
     for (const auto& [dword, stamp] : group) {
         // Only an entry still ours (stamps are unique): a later note of the dword has its own group.
         // And only while its batch is unsubmitted: a submitted one (a drain or APS5_LABEL_SUBMIT_NOW
@@ -1731,16 +1840,17 @@ void Recorder::NoteQueuedLabel(std::uint64_t address, std::span<const std::byte>
     QueuedLabelRanges().emplace_back(address, address + bytes.size());
     queuedLabelsNoted.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard tableLock(labelTableMutex);
-    if (labelTableOwner == nullptr) return;
-    auto& recorded = labelTableOwner->labels;
-    auto& table = SeparateQueuedLabels() ? labelTableOwner->queuedLabels : recorded;
+    Recorder* const owner = ThreadLabelTable();
+    if (owner == nullptr) return;
+    auto& recorded = owner->labels;
+    auto& table = SeparateQueuedLabels() ? owner->queuedLabels : recorded;
     for (std::size_t offset = 0; offset + 4 <= bytes.size(); offset += 4) {
         std::uint32_t value = 0;
         std::memcpy(&value, bytes.data() + offset, 4);
         if (const auto found = recorded.find(address + offset); found != recorded.end() && found->second.batch != nullptr) queuedLabelsOverRecorded.fetch_add(1, std::memory_order_relaxed);
         table.insert_or_assign(address + offset, LabelEntry{value, queue, stamp, nullptr});
     }
-    labelTableOwner->recordedLabels.store(recorded.size(), std::memory_order_relaxed);
+    owner->recordedLabels.store(recorded.size(), std::memory_order_relaxed);
 }
 
 void Recorder::ForgetQueuedLabels() {
@@ -1748,9 +1858,10 @@ void Recorder::ForgetQueuedLabels() {
     auto ranges = std::move(QueuedLabelRanges());
     QueuedLabelRanges().clear();
     std::lock_guard tableLock(labelTableMutex);
-    if (labelTableOwner == nullptr) return;
-    auto& recorded = labelTableOwner->labels;
-    auto& queued = labelTableOwner->queuedLabels;
+    Recorder* const owner = ThreadLabelTable();
+    if (owner == nullptr) return;
+    auto& recorded = owner->labels;
+    auto& queued = owner->queuedLabels;
     const auto tag = GuestMemory::GpuLockThreadTag();
     for (const auto& [begin, end] : ranges) {
         for (auto dword = begin; dword + 4 <= end; dword += 4) {
@@ -1759,7 +1870,7 @@ void Recorder::ForgetQueuedLabels() {
             if (found != recorded.end() && found->second.batch == nullptr) recorded.erase(found);
         }
     }
-    labelTableOwner->recordedLabels.store(recorded.size(), std::memory_order_relaxed);
+    owner->recordedLabels.store(recorded.size(), std::memory_order_relaxed);
 }
 
 void Recorder::SetQueuedLabelRecorder(void (*recorder)()) {
@@ -3283,10 +3394,10 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     }
     if (!ownLabel) markOverwritten(address, end);
     // A poller waiting on this range learns that the open batch may now hold its producer.
-    if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
+    if (Registered(this)) writeGeneration.fetch_add(1, std::memory_order_release);
     // Consecutive dispatches write the same output buffers: a range the snapshot already contains
     // leaves the published union unchanged, so the O(N log N) rebuild is skipped.
-    if (SnapshotCovers(address, end)) {
+    if (SnapshotCovers(address, end, SlotOf(this))) {
         ++snapshotCovered;
         return false;
     }
@@ -3308,8 +3419,8 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     batch.writeNotes.push_back(++writeNoteCount);
     batch.writeValues.push_back(-1);
     if (!ownLabel) markOverwritten(address, address + bytes);
-    if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
-    if (!SnapshotCovers(address, address + bytes)) publishPendingWrites();
+    if (Registered(this)) writeGeneration.fetch_add(1, std::memory_order_release);
+    if (!SnapshotCovers(address, address + bytes, SlotOf(this))) publishPendingWrites();
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
@@ -3357,7 +3468,7 @@ void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::u
 void Recorder::publishPendingWrites() const {
     // Only the active recorder owns the snapshot: one torn down after its successor was activated,
     // or one a worker still dispatches into after device.reset(), must not publish its ranges.
-    if (activeRecorder != this) return;
+    if (!Registered(this)) return;
     const auto started = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto merged = std::make_shared<WriteRanges>();
     if (open != nullptr) merged->insert(merged->end(), open->writes.begin(), open->writes.end());
@@ -3370,7 +3481,8 @@ void Recorder::publishPendingWrites() const {
         else (*merged)[out++] = {begin, end};
     }
     merged->resize(out);
-    pendingWrites.store(std::move(merged), std::memory_order_release);
+    ownPendingWrites[SlotOf(this)].store(std::move(merged), std::memory_order_release);
+    PublishPendingUnion();
     publishGeneration.fetch_add(1, std::memory_order_release);
     ++snapshotRebuilds;
     if (DrawProfiled()) snapshotRebuildMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -3395,7 +3507,7 @@ bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) co
 
 bool Recorder::PendingWriteOverlapsScreened(std::uint64_t address, std::size_t bytes) const {
     if (bytes == 0) return false;
-    if (activeRecorder == this) {
+    if (Registered(this)) {
         const auto snapshot = pendingWrites.load(std::memory_order_acquire);
         if (!AgcDriver::Graphics::SnapshotOverlaps(snapshot.get(), address, bytes)) {
             static const bool verify = std::getenv("APS5_VERIFY_DRAW_TOKENS") != nullptr;
@@ -3629,8 +3741,8 @@ void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes
         open->wideLabels.push_back(wideLabels.emplace(address, address + bytes.size()));
         wideLabelBytes = std::max<std::uint64_t>(wideLabelBytes, bytes.size());
     }
-    if (!std::exchange(lastStoreInRun, false) && activeRecorder == this && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
-        pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
+    if (!std::exchange(lastStoreInRun, false) && Registered(this) && pendingLabelSince[SlotOf(this)].load(std::memory_order_relaxed) == NoPendingLabel) {
+        pendingLabelSince[SlotOf(this)].store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
     }
     noteWriteOn(*open, address, bytes.size(), true);
 }
@@ -3767,8 +3879,8 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
     // poller that sees the bump then finds the label without the GPU mutex.
     noteLabelOn(batch, address, bytes, stamp, queue, behindCompletion);
     noteWriteOn(batch, address, bytes.size(), true);
-    if (&batch == open.get() && activeRecorder == this && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
-        pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
+    if (&batch == open.get() && Registered(this) && pendingLabelSince[SlotOf(this)].load(std::memory_order_relaxed) == NoPendingLabel) {
+        pendingLabelSince[SlotOf(this)].store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
     }
 }
 
@@ -3782,15 +3894,23 @@ bool Recorder::AfterRecordedWork(std::function<void()> action) {
     ++batch.recordedWorkActions;
     completionLabels.fetch_add(1, std::memory_order_acq_rel);
     if (&batch != open.get() && CompletionWorkTracked()) trackCompletionWork(batch);
-    if (&batch == open.get() && activeRecorder == this && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
-        pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
+    if (&batch == open.get() && Registered(this) && pendingLabelSince[SlotOf(this)].load(std::memory_order_relaxed) == NoPendingLabel) {
+        pendingLabelSince[SlotOf(this)].store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
     }
     return true;
 }
 
 void Recorder::NoteWrittenBack(std::uint64_t address, std::size_t bytes) {
-    Recorder* recorder = activeRecorder;
-    if (recorder == nullptr || bytes == 0) return;
+    if (bytes == 0) return;
+    // A write-back lands in guest memory whichever recorder's batch produced it: both recorders' labels
+    // over it need their completion store.
+    for (Recorder* recorder : {activeRecorder, asyncRecorder}) {
+        if (recorder != nullptr) recorder->noteWrittenBackHere(address, bytes);
+    }
+}
+
+void Recorder::noteWrittenBackHere(std::uint64_t address, std::size_t bytes) {
+    Recorder* recorder = this;
     GuestMemory::AssertGpuLockHeld("Recorder::NoteWrittenBack");
     const auto end = address + bytes;
     {
@@ -3837,7 +3957,7 @@ void Recorder::Submit() {
     // call returns (outside the mutex), so a submit by another thread in between leaves a stale
     // count behind, and the callers that act on it would otherwise take the mutex for nothing at
     // every packet or submission end until a real batch is next submitted.
-    if (activeRecorder == this) workSinceSubmit.store(0, std::memory_order_relaxed);
+    if (Registered(this)) workSinceSubmit[SlotOf(this)].store(0, std::memory_order_relaxed);
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
     if (!open->keyStores.empty()) recordKeyStores(false);
@@ -3903,11 +4023,11 @@ void Recorder::Submit() {
     if (batch->completionLabelCount != 0 && CompletionWorkTracked()) trackCompletionWork(*batch);
     inFlight.push_back(std::move(batch));
     inFlightKeptBytes += inFlight.back()->keptBytes;
-    if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+    if (Registered(this)) pendingLabelSince[SlotOf(this)].store(NoPendingLabel, std::memory_order_release);
 }
 
 bool Recorder::SubmitIfStarved(std::uint64_t minWork) {
-    if (open == nullptr || workSinceSubmit.load(std::memory_order_relaxed) < minWork) return false;
+    if (open == nullptr || workSinceSubmit[SlotOf(this)].load(std::memory_order_relaxed) < minWork) return false;
     // A batch whose submit is still queued for the recorder thread reads as unsignaled: busy.
     if (!inFlight.empty() && fenceStatus(inFlight.back()->fence) != VK_SUCCESS) return false;
     Submit();
@@ -4033,7 +4153,7 @@ bool Recorder::WaitCompletionWork(std::uint64_t& recorder, std::uint64_t& serial
 std::size_t Recorder::FinishCompletionWork(std::uint64_t recorderId, std::uint64_t serial) {
     const bool profile = DrawProfiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    Recorder* recorder = activeRecorder;
+    Recorder* recorder = asyncRecorder != nullptr && asyncRecorder->id == recorderId ? asyncRecorder : activeRecorder;
     const bool active = recorder != nullptr && recorder->id == recorderId;
     std::size_t retired = 0;
     if (active) {

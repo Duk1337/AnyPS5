@@ -512,6 +512,15 @@ public:
     // there must not have a publish recorded for it (UnitShadow), see SyncThrough.
     static bool InCompletion();
     void Activate();
+    // APS5_ASYNC_QUEUES: a second recorder bound to its own Vulkan queue. ActivateAsync registers it;
+    // RouteThisThread(true) makes Active() (and the per-recorder readers above) refer to it on the
+    // calling thread, a queue worker of a listed guest queue. Every other thread keeps the main one.
+    void ActivateAsync();
+    static Recorder* Async();
+    static void RouteThisThread(bool async);
+    // The APS5_ASYNC_QUEUES list: whether any guest queue is listed, and whether `queue` is.
+    static bool AsyncQueuesRequested();
+    static bool AsyncQueueListed(std::uint32_t queue);
     // APS5_PROFILE_DRAW: syncs by source (0 device idle, 1 CPU access to pending writes, 2 CPU read
     // after a recorded store, 3 address-based dispatch, 4 other). Contract: the call announces the
     // source for the Sync/SyncThrough this thread makes NEXT, which consumes it (a sync without a
@@ -917,6 +926,8 @@ private:
     // Whether a write-back noted after `sequence` overlapped [begin, end); true when the ring no
     // longer reaches back to `sequence` (conservative: the store runs as before).
     bool writtenBackSince(std::uint64_t sequence, std::uint64_t begin, std::uint64_t end);
+    // NoteWrittenBack's work on one recorder (each registered recorder notes every write-back).
+    void noteWrittenBackHere(std::uint64_t address, std::size_t bytes);
     std::mutex writtenBackMutex;
     std::deque<std::array<std::uint64_t, 3>> writtenBack;
     std::uint64_t writtenBackSequence = 0;
