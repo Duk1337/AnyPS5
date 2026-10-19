@@ -177,6 +177,9 @@ public:
     // overlapping pending image, as before).
     static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr);
     static void FlushAllPending(const char* reason);
+    // Waits until no other thread is storing an image over the range (FlushPending moved it to the
+    // flushing list); returns whether it waited. Never waits while this thread holds the GPU mutex.
+    static bool WaitForFlushing(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr);
     // Stores the pending results of every image of at most SmallStoreBytes guest bytes in
     // host-imported memory, recorded behind the work recorded so far (no CPU wait); called at each
     // flip. The guest CPU reads GPU results straight from memory, which no flush hook sees: a title

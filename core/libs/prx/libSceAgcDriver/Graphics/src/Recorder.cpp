@@ -1527,6 +1527,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     std::size_t images = 0, evicted = 0;
     const bool kept = !HookFlushCpuBlocks() && StorageTexture::AccessKeptByCpu(address, bytes, &images, &evicted);
     if (kept || (images == 0 && !HookFlushCpuBlocks())) {
+        stored = StorageTexture::WaitForFlushing(address, bytes);
         published = StorageTexture::PublishShadowsOnly(address, bytes, scope);
         if (kept && HookSyncProfiled()) CountRecordedStoreSkip(RecordedStoreKey(), evicted);
     } else {
@@ -3655,6 +3656,40 @@ bool Recorder::PendingWriteOverlapsScreened(std::uint64_t address, std::size_t b
 
 bool Recorder::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
     return bytes != 0 && open != nullptr && overlaps(*open, address, address + bytes);
+}
+
+std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return 0;
+    const auto end = address + bytes;
+    const auto writes = [&](const Batch& batch) {
+        if (overlaps(batch, address, end)) return true;
+        for (const auto& read : batch.reads) {
+            if (read.kind == ReadKind::AddressBased && address < read.end && read.begin < end) return true;
+        }
+        return false;
+    };
+    if (open != nullptr && writes(*open)) return submissions + 1;
+    for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
+        if (writes(**it)) return (*it)->serial;
+    }
+    return 0;
+}
+
+void Recorder::FinishPendingWriters(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || InCompletion()) return;
+    // Each recorder is re-read after the other's wait, like the flush hook's.
+    for (int slot = 0; slot < 2; ++slot) {
+        auto* recorder = slot == 0 ? activeRecorder : asyncRecorder;
+        if (recorder == nullptr) continue;
+        const auto writer = recorder->PendingWriterSerial(address, bytes);
+        if (writer == 0) continue;
+        if (writer == recorder->submissions + 1) {
+            CountSync(recorder->OpenWriteOverlaps(address, bytes) ? 1 : 3);
+            recorder->Sync();
+        } else {
+            recorder->FinishUpTo(writer);
+        }
+    }
 }
 
 bool Recorder::signaled(const Batch& batch) const {

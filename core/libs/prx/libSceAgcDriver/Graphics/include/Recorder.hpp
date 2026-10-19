@@ -264,6 +264,14 @@ public:
     static ReadStatistics ReadCounts();
     // Whether the OPEN (unsubmitted) batch writes the range: a wait on such a range must submit it.
     bool OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
+    // The serial of the newest unfinished batch that writes the range or holds it in an address-based
+    // lease (the open batch reports the serial it will get), 0 when none does.
+    std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes) const;
+    // Under the mutex, before a storage image's pending results are stored over the range: both
+    // recorders finish their unfinished batches up to the range's newest writer (syncing when it is
+    // the open batch), so an address-based store's completion marks its blocks before the flush
+    // decides which blocks to keep (upstream #6364). Does not wait inside a completion action.
+    static void FinishPendingWriters(std::uint64_t address, std::size_t bytes);
     // What SyncThrough(address, bytes) would wait for, for the [hooksync] attribution: the newest
     // batch whose noted range overlaps the access (the open batch counts first, with the serial it
     // will get), whether that batch's fence has already signaled (its GPU work is done, so the
