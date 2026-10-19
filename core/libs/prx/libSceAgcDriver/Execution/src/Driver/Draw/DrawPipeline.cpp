@@ -1,5 +1,6 @@
 #include "CpuCostDiagnostic.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/ReplayProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
@@ -434,6 +435,7 @@ void DrawPipeline::prepRun() {
             std::chrono::steady_clock::time_point start;
             std::pair<double, std::uint64_t> syncsBefore;
             Waits waitsBefore;
+            std::array<double, DrawDriverPhaseCount> phasesBefore;
             ~SlowPrep() {
                 // [slow-prep] (APS5_PROFILE_DRAW): a preparation job over 5 ms, with the GPU-sync
                 // waits it made, since one slow job stalls the in-order hand-off behind it.
@@ -449,9 +451,20 @@ void DrawPipeline::prepRun() {
                 if (now - began > 10'000'000'000ll && windowStart.compare_exchange_strong(began, now)) told.store(0, std::memory_order_relaxed);
                 if (told.fetch_add(1, std::memory_order_relaxed) >= 25) return;
                 const auto syncs = Graphics::ThreadHookSyncs();
-                std::fprintf(stderr, "[slow-prep] %.1f ms (GPU-sync waits %.1f ms in %llu; waited for: turn %.1f ms, committer room %.1f ms, drains %.1f ms, GPU mutex %.1f ms)\n", ms, syncs.first - syncsBefore.first, static_cast<unsigned long long>(syncs.second - syncsBefore.second), threadTurnWaitMs - waitsBefore.turn, threadRoomWaitMs - waitsBefore.room, threadDrainWaitMs - waitsBefore.drain, GuestMemory::ThreadGpuLockWaitMs() - waitsBefore.lock);
+                // The job's own draw phases, largest first (the draw() it ran adds them per thread).
+                std::array<std::pair<double, std::size_t>, DrawDriverPhaseCount> phases{};
+                const auto& after = ThreadDrawPhaseMs();
+                for (std::size_t i = 0; i < DrawDriverPhaseCount; ++i) phases[i] = {after[i] - phasesBefore[i], i};
+                std::sort(phases.begin(), phases.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                std::string top;
+                for (std::size_t i = 0; i < 3 && phases[i].first >= 0.5; ++i) {
+                    char item[64];
+                    std::snprintf(item, sizeof(item), "%s%s %.1f ms", top.empty() ? "" : ", ", DrawDriverPhaseNames[phases[i].second], phases[i].first);
+                    top += item;
+                }
+                std::fprintf(stderr, "[slow-prep] %.1f ms (GPU-sync waits %.1f ms in %llu; waited for: turn %.1f ms, committer room %.1f ms, drains %.1f ms, GPU mutex %.1f ms; phases: %s)\n", ms, syncs.first - syncsBefore.first, static_cast<unsigned long long>(syncs.second - syncsBefore.second), threadTurnWaitMs - waitsBefore.turn, threadRoomWaitMs - waitsBefore.room, threadDrainWaitMs - waitsBefore.drain, GuestMemory::ThreadGpuLockWaitMs() - waitsBefore.lock, top.empty() ? "none recorded" : top.c_str());
             }
-        } slowPrep{start, syncsBefore, waitsBefore};
+        } slowPrep{start, syncsBefore, waitsBefore, ThreadDrawPhaseMs()};
         try {
             CpuCost::Scope diagPrep(CpuCost::Op::PrepJob);
             job.second();

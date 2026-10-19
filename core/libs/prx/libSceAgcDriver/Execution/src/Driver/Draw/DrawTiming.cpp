@@ -9,7 +9,14 @@ PendingDrawPhases& Driver::pendingDrawPhases() {
     return pending;
 }
 
+std::array<double, DrawDriverPhaseCount>& ThreadDrawPhaseMs() {
+    static thread_local std::array<double, DrawDriverPhaseCount> ms{};
+    return ms;
+}
+
 void Driver::addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures) {
+    auto& own = ThreadDrawPhaseMs();
+    for (std::size_t i = 0; i < DrawDriverPhaseCount; ++i) own[i] += ms[i];
     std::lock_guard lock(drawPhasesMutex);
     auto& totals = drawPhaseTotals;
     for (std::size_t i = 0; i < DrawDriverPhaseCount; ++i) totals.ms[i] += ms[i];

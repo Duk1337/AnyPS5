@@ -32,6 +32,10 @@ struct DrawPhaseTiming {
     void Phase(DrawDriverPhase which);
 };
 
+// The calling thread's draw phase totals so far (APS5_PROFILE_DRAW): a draw-preparation job's share is
+// the difference around it, which the [slow-prep] line breaks down.
+std::array<double, DrawDriverPhaseCount>& ThreadDrawPhaseMs();
+
 }
 
 #endif
