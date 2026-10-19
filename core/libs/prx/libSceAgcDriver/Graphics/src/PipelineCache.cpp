@@ -49,6 +49,7 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
     if (const char* own = std::getenv("APS5_PIPELINE_CACHE_DIR"); own && *own) {
         directory = own;
         readOnly = false;
+        ownDirectory = true;
     } else {
         readOnly = ShaderRecompiler::CachePersistence::ReadOnly();
         directory = ShaderRecompiler::ShaderCacheDirectory();
@@ -149,9 +150,14 @@ void PipelineCache::save(bool final) {
     std::size_t size = 0;
     if (getData(context.device, cache, &size, nullptr) != VK_SUCCESS || size == 0 || size == savedBytes) return;
     // A large cache is rewritten whole: between the teardown saves, only growth of a quarter (at
-    // least 16 MiB) or ten minutes since the last save pays for another copy, hash and write.
+    // least 16 MiB) or ten minutes since the last save pays for another copy, hash and write. Its
+    // own directory (APS5_PIPELINE_CACHE_DIR) saves 8 MiB of growth after 30 s instead: the title
+    // crashes on close, so the teardown save never runs and later pipelines would be lost.
     const auto now = std::chrono::steady_clock::now();
-    if (!final && size - std::min(size, savedBytes) < std::max<std::size_t>(savedBytes / 4u, std::size_t{16} << 20u) && now - savedAt < std::chrono::minutes(10)) return;
+    const auto grown = size - std::min(size, savedBytes);
+    if (!final && ownDirectory) {
+        if (grown < (std::size_t{8} << 20u) || now - savedAt < std::chrono::seconds(30)) return;
+    } else if (!final && grown < std::max<std::size_t>(savedBytes / 4u, std::size_t{16} << 20u) && now - savedAt < std::chrono::minutes(10)) return;
     std::lock_guard fileLock(filesMutex);
     if (size <= fileBytes[path.string()]) return;
     std::vector<std::byte> file(sizeof(FileHeader) + size);
