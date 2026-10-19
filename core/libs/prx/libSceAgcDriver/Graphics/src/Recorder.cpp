@@ -34,6 +34,16 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace AgcDriver::Graphics {
 
@@ -1547,7 +1557,129 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
 
 }
 
+namespace {
+// APS5_WRITE_MAP=<file> (diagnostic): who wrote each 64 KiB unit of guest memory and when, rewritten
+// to the file every 10 s. A unit keeps its last 8 events: G a noted GPU write (with the noting site
+// and program), S a driver store, C a page a walk reported CPU-written, W a walk after the driver's
+// own store, I an import-window walk. Only units with both a CPU event and a GPU write or driver
+// store are listed: a write landing over bytes the title stored is what would corrupt them.
+class WriteMap {
+public:
+    static void Init() {
+        static std::once_flag once;
+        std::call_once(once, [] {
+            const char* path = std::getenv("APS5_WRITE_MAP");
+            if (path == nullptr || *path == '\0') return;
+            instance.store(new WriteMap(path), std::memory_order_release);
+        });
+    }
+    static WriteMap* Get() { return instance.load(std::memory_order_acquire); }
+
+    void Note(char kind, std::uint64_t begin, std::uint64_t end, const void* site, std::uint64_t program) {
+        if (end <= begin) return;
+        const auto ms = static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+        const auto first = begin >> 16;
+        const auto last = (end - 1) >> 16;
+        std::lock_guard lock(mutex);
+        const auto add = [&](std::uint64_t unit) {
+            auto& entry = units[unit];
+            entry.events[entry.next++ % entry.events.size()] = {ms, kind, site, program, begin, end};
+            if (kind == 'G' || kind == 'S') entry.written = true;
+            else if (kind == 'C') entry.cpu = true;
+        };
+        // A write over more than 1 GiB names its first and last units only.
+        if (last - first > 16384) {
+            add(first);
+            add(last);
+            ++wide;
+            return;
+        }
+        for (auto unit = first; unit <= last; ++unit) add(unit);
+    }
+
+private:
+    struct Event {
+        std::uint32_t ms = 0;
+        char kind = 0;
+        const void* site = nullptr;
+        std::uint64_t program = 0;
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+    };
+    struct Unit {
+        std::array<Event, 8> events{};
+        std::uint32_t next = 0;
+        bool written = false;
+        bool cpu = false;
+    };
+
+    explicit WriteMap(std::string path) : path(std::move(path)), start(std::chrono::steady_clock::now()) {
+        HMODULE module = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(&WriteMap::Init), &module);
+        base = reinterpret_cast<std::uintptr_t>(module);
+        GuestMemory::SetWriteMapObserver([](std::uint64_t address, std::size_t bytes, int origin) {
+            static constexpr char kinds[] = {'C', 'W', 'I', 'S'};
+            if (auto* map = Get()) map->Note(kinds[origin & 3], address, address + bytes, nullptr, 0);
+        });
+        std::fprintf(stderr, "[write-map] on: %s (prx base 0x%llx)\n", this->path.c_str(), static_cast<unsigned long long>(base));
+        std::thread([this] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(10));
+                dump();
+            }
+        }).detach();
+    }
+
+    void dump() {
+        struct Listed {
+            std::uint64_t unit;
+            Unit entry;
+        };
+        std::vector<Listed> listed;
+        std::size_t total = 0, wideNow = 0;
+        {
+            std::lock_guard lock(mutex);
+            total = units.size();
+            wideNow = wide;
+            for (const auto& [unit, entry] : units) {
+                if (entry.written && entry.cpu) listed.push_back({unit, entry});
+            }
+        }
+        std::sort(listed.begin(), listed.end(), [](const Listed& a, const Listed& b) { return a.unit < b.unit; });
+        const auto ms = static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+        const auto temporary = path + ".tmp";
+        if (FILE* file = std::fopen(temporary.c_str(), "w")) {
+            std::fprintf(file, "# write-map t=%llu ms prx=0x%llx units=%zu listed=%zu wide=%zu\n", ms, static_cast<unsigned long long>(base), total, listed.size(), wideNow);
+            for (const auto& [unit, entry] : listed) {
+                std::fprintf(file, "unit 0x%llx\n", static_cast<unsigned long long>(unit << 16));
+                const auto count = std::min<std::uint32_t>(entry.next, entry.events.size());
+                for (std::uint32_t i = 0; i < count; ++i) {
+                    const auto& event = entry.events[(entry.next - count + i) % entry.events.size()];
+                    const auto site = reinterpret_cast<std::uintptr_t>(event.site);
+                    std::fprintf(file, "  %u %c 0x%llx-0x%llx", event.ms, event.kind, static_cast<unsigned long long>(event.begin), static_cast<unsigned long long>(event.end));
+                    if (site != 0) std::fprintf(file, " site=%s0x%llx", site >= base ? "+" : "", static_cast<unsigned long long>(site >= base ? site - base : site));
+                    if (event.program != 0) std::fprintf(file, " program=0x%llx", static_cast<unsigned long long>(event.program));
+                    std::fputc('\n', file);
+                }
+            }
+            std::fclose(file);
+            MoveFileExA(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+        }
+        std::fprintf(stderr, "[write-map] t=%llu ms: %zu units, %zu listed\n", ms, total, listed.size());
+    }
+
+    static inline std::atomic<WriteMap*> instance{nullptr};
+    std::string path;
+    std::chrono::steady_clock::time_point start;
+    std::uintptr_t base = 0;
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, Unit> units;
+    std::size_t wide = 0;
+};
+}
+
 Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)) {
+    WriteMap::Init();
     {
         std::lock_guard lock(liveRecordersMutex);
         liveRecorders.push_back(id);
@@ -3354,7 +3486,7 @@ thread_local std::uint64_t t_noteProgram = 0;
 std::array<NoteSiteEntry, 8192> noteSites{};
 std::mutex noteSitesMutex;
 bool NoteSitesOn() {
-    static const bool on = std::getenv("APS5_TRACE_DCC_SYNC") != nullptr;
+    static const bool on = std::getenv("APS5_TRACE_DCC_SYNC") != nullptr || WriteMap::Get() != nullptr;
     return on;
 }
 }
@@ -3385,6 +3517,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
     open->writeValues.push_back(static_cast<std::int16_t>(value));
+    if (auto* map = WriteMap::Get()) map->Note('G', address, end, t_noteSite, t_noteProgram);
     if (NoteSitesOn()) {
         std::lock_guard lock(noteSitesMutex);
         noteSites[writeNoteCount % noteSites.size()] = {writeNoteCount, std::exchange(t_noteSite, nullptr), t_noteProgram};
@@ -3413,6 +3546,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
     batch.writes.emplace_back(address, address + bytes);
+    if (auto* map = WriteMap::Get()) map->Note('G', address, address + bytes, nullptr, 0);
     batch.writeNotes.push_back(++writeNoteCount);
     batch.writeValues.push_back(-1);
     if (!ownLabel) markOverwritten(address, address + bytes);

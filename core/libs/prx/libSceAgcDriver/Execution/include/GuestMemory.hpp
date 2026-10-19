@@ -112,6 +112,10 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // written and for the pages a fresh commit replaced; `stored` with the bytes the driver stored
 // itself (storeOwn). Both run under the tracker mutex and must not call back into the tracker.
 void SetCaptureObservers(void (*dirty)(std::uint64_t address, std::size_t bytes), void (*stored)(std::uint64_t address, std::size_t bytes));
+// APS5_WRITE_MAP diagnostics (Recorder.cpp): the same pages and stores with their origin (0: a page a
+// walk reported CPU-written, 1: a walk after the driver's own store, 2: an import-window walk, 3: a
+// driver store). Runs under the tracker mutex like the capture observers.
+void SetWriteMapObserver(void (*observer)(std::uint64_t address, std::size_t bytes, int origin));
 // A CPU collect (as CollectWritesUncached) of the watched, committed parts of the range; blocks the
 // tracker excluded (host imports) have their dirty bits reset and reported without stamps.
 // `unwatched` receives the committed parts whose dirty bits cannot be read.

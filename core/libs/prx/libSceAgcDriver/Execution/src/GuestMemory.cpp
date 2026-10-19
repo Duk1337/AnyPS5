@@ -133,6 +133,7 @@ void noteWait(std::atomic<std::uint64_t>& total, std::atomic<std::uint64_t>& lon
 std::atomic<std::uint64_t> trackerAcquisitions{0};
 std::atomic<void (*)(std::uint64_t, std::size_t)> dirtyObserver{nullptr};
 std::atomic<void (*)(std::uint64_t, std::size_t)> storeObserver{nullptr};
+std::atomic<void (*)(std::uint64_t, std::size_t, int)> writeMapObserver{nullptr};
 std::uintptr_t PagesBase();
 std::size_t PagesSize();
 std::uintptr_t ImagePagesBase();
@@ -1155,6 +1156,7 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
     }
     unwatchSerial.fetch_add(1, std::memory_order_release);
     if (const auto observer = dirtyObserver.load(std::memory_order_acquire)) observer(address, bytes);
+    if (const auto map = writeMapObserver.load(std::memory_order_acquire)) map(address, bytes, 0);
 }
 #endif
 
@@ -1299,6 +1301,7 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     if (kind != StampKind::Driver) tracker.noteCpuStore(begin, end, generation);
     for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) tracker.stamp(block, generation, kind);
     if (const auto observer = dirtyObserver.load(std::memory_order_acquire)) observer(begin, end - begin);
+    if (const auto map = writeMapObserver.load(std::memory_order_acquire)) map(begin, end - begin, static_cast<int>(kind));
     collectDirtyRuns.fetch_add(1, std::memory_order_relaxed);
 }
 #endif
@@ -1326,11 +1329,13 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
         ++tracker.generation;
         bumped = true;
         const auto observer = dirtyObserver.load(std::memory_order_acquire);
+        const auto map = writeMapObserver.load(std::memory_order_acquire);
         for (ULONG_PTR i = 0; i < count; ++i) {
             const auto page = reinterpret_cast<std::uintptr_t>(tracker.pages[i]);
             tracker.stamp(tracker.blockOf(page), tracker.generation, kind);
             if (kind != StampKind::Driver) tracker.noteCpuStore(page, page + WritePageBytes, tracker.generation);
             if (observer != nullptr) observer(page, WritePageBytes);
+            if (map != nullptr) map(page, WritePageBytes, static_cast<int>(kind));
         }
     };
     while (cursor < stop) {
@@ -1720,10 +1725,12 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         lock.lock();
         ++tracker.generation;
         const auto observer = dirtyPages.empty() ? nullptr : dirtyObserver.load(std::memory_order_acquire);
+        const auto map = dirtyPages.empty() ? nullptr : writeMapObserver.load(std::memory_order_acquire);
         for (const auto page : dirtyPages) {
             tracker.stamp(tracker.blockOf(page), tracker.generation, StampKind::Cpu);
             tracker.noteCpuStore(page, page + WritePageBytes, tracker.generation);
             if (observer != nullptr) observer(page, WritePageBytes);
+            if (map != nullptr) map(page, WritePageBytes, 0);
         }
         if (!dirtyPages.empty()) collectDirty.fetch_add(1, std::memory_order_relaxed);
         lastWalkDirty = !dirtyPages.empty();
@@ -1809,6 +1816,10 @@ void SetCaptureObservers(void (*dirty)(std::uint64_t, std::size_t), void (*store
     storeObserver.store(stored, std::memory_order_release);
 }
 
+void SetWriteMapObserver(void (*observer)(std::uint64_t, std::size_t, int)) {
+    writeMapObserver.store(observer, std::memory_order_release);
+}
+
 namespace {
 
 // The capture's walk of blocks the tracker excluded (host imports): their dirty bits still record
@@ -1819,12 +1830,16 @@ bool peekWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) 
     // Excluded guest imports may still be watched; pre-existing host holes are not.
     if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(first, static_cast<std::size_t>(stop - first))) return false;
     const auto observer = dirtyObserver.load(std::memory_order_acquire);
+    const auto map = writeMapObserver.load(std::memory_order_acquire);
     std::vector<void*> pages(4096);
     for (auto cursor = first; cursor < stop;) {
         std::size_t count = pages.size();
         if (!GuestArena::GuestArenaCollectWrites_nid_postfix(cursor, static_cast<std::size_t>(stop - cursor), pages.data(), &count, true)) return false;
         if (observer != nullptr) {
             for (std::size_t i = 0; i < count; ++i) observer(reinterpret_cast<std::uintptr_t>(pages[i]), WritePageBytes);
+        }
+        if (map != nullptr) {
+            for (std::size_t i = 0; i < count; ++i) map(reinterpret_cast<std::uintptr_t>(pages[i]), WritePageBytes, 0);
         }
         if (count < pages.size()) break;
         cursor = reinterpret_cast<std::uintptr_t>(pages[count - 1]) + WritePageBytes;
@@ -2012,6 +2027,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second > stored.first) {
             if (const auto observer = storeObserver.load(std::memory_order_acquire)) observer(stored.first, static_cast<std::size_t>(stored.second - stored.first));
+            if (const auto map = writeMapObserver.load(std::memory_order_acquire)) map(stored.first, static_cast<std::size_t>(stored.second - stored.first), 3);
         }
         if (stored.second <= stored.first || !tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) return 0;
         ++tracker.generation;
