@@ -42,8 +42,17 @@ bool profiling() {
 }
 
 PipelineCache::PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties) : context(context), properties(properties) {
-    (void)ShaderRecompiler::CachePersistence::ReadOnly();
-    const auto directory = ShaderRecompiler::ShaderCacheDirectory();
+    // APS5_PIPELINE_CACHE_DIR gives the pipeline cache its own writable directory, so a read-only
+    // shader cache (ANYPS5_CACHE_READ_ONLY=1) no longer freezes it: the saved file is only valid for
+    // the driver that wrote it, and after a driver update every pipeline was compiled again each run.
+    std::filesystem::path directory;
+    if (const char* own = std::getenv("APS5_PIPELINE_CACHE_DIR"); own && *own) {
+        directory = own;
+        readOnly = false;
+    } else {
+        readOnly = ShaderRecompiler::CachePersistence::ReadOnly();
+        directory = ShaderRecompiler::ShaderCacheDirectory();
+    }
     if (!directory.empty()) {
         std::string uuid;
         for (const auto byte : properties.pipelineCacheUUID) {
@@ -57,7 +66,7 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
     }
     std::vector<std::byte> initialData;
     if (!path.empty()) {
-        if (!ShaderRecompiler::CachePersistence::ReadOnly()) {
+        if (!readOnly) {
             std::error_code error;
             const auto prefix = path.filename().string() + ".tmp.";
             for (const auto& entry : std::filesystem::directory_iterator(path.parent_path(), error)) {
@@ -135,7 +144,7 @@ void PipelineCache::load(std::vector<std::byte>& initialData) {
 }
 
 void PipelineCache::save(bool final) {
-    if (ShaderRecompiler::CachePersistence::ReadOnly()) return; // Before getData, allocation or materialisation.
+    if (readOnly) return; // Before getData, allocation or materialisation.
     const auto getData = context.Function<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData");
     std::size_t size = 0;
     if (getData(context.device, cache, &size, nullptr) != VK_SUCCESS || size == 0 || size == savedBytes) return;
