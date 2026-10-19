@@ -18,11 +18,75 @@
 #include <atomic>
 #include <cstdlib>
 #include <functional>
+#include <algorithm>
+#include <cstring>
+#include <map>
+#include <mutex>
 #include <shared_mutex>
+#include <tuple>
 
 namespace AgcDriver::DriverDetail {
 
 namespace {
+
+// Debug aid: APS5_LABEL_WATCH=<hex low>-<hex high> names the queue packets that write a label
+// (RELEASE_MEM or WRITE_DATA) into that guest range: per 10 s the most frequent (address, queue,
+// opcode, value) and the first matches with how long after its submission was queued the packet ran
+// and where in the submission it sits. Finds what the game's frame fences wait for.
+struct LabelWatch {
+    std::uint64_t low = 0, high = 0;
+    std::mutex mutex;
+    std::map<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t, std::uint64_t>, std::uint64_t> counts;
+    int detailed = 0;
+    std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
+};
+
+LabelWatch* labelWatch() {
+    static LabelWatch* watch = [] () -> LabelWatch* {
+        const char* text = std::getenv("APS5_LABEL_WATCH");
+        if (text == nullptr) return nullptr;
+        char* end = nullptr;
+        auto* parsed = new LabelWatch();
+        parsed->low = std::strtoull(text, &end, 16);
+        parsed->high = *end == '-' ? std::strtoull(end + 1, nullptr, 16) : parsed->low + 8;
+        std::fprintf(stderr, "[label-watch] watching label writes to 0x%llx-0x%llx\n", static_cast<unsigned long long>(parsed->low), static_cast<unsigned long long>(parsed->high));
+        return parsed;
+    }();
+    return watch;
+}
+
+void noteWatchedLabel(const Submission& submission, std::span<const std::uint32_t> packet, std::uint32_t opcode, std::size_t cursor) {
+    auto* watch = labelWatch();
+    if (watch == nullptr || (opcode != 0x49 && opcode != 0x37)) return;
+    const auto label = Pm4::DecodeLabelWrite(packet);
+    if (!label.has_value() || label->address < watch->low || label->address >= watch->high) return;
+    const auto bytes = label->Bytes();
+    std::uint64_t value = 0;
+    std::memcpy(&value, bytes.data(), std::min<std::size_t>(bytes.size(), sizeof(value)));
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(watch->mutex);
+    ++watch->counts[{label->address, submission.queue, opcode, value}];
+    if (watch->detailed < 40) {
+        ++watch->detailed;
+        const double sinceQueued = submission.enqueuedAt == std::chrono::steady_clock::time_point{} ? -1.0 : std::chrono::duration<double, std::milli>(now - submission.enqueuedAt).count();
+        std::fprintf(stderr, "[label-watch] t=%lld ms address 0x%llx value 0x%llx (%zu bytes) queue 0x%x opcode 0x%02x submission %llu at dword %zu of %zu, %.1f ms after it was queued\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count()), static_cast<unsigned long long>(label->address), static_cast<unsigned long long>(value), bytes.size(), submission.queue, opcode, static_cast<unsigned long long>(submission.serial), cursor, submission.commands.size(), sinceQueued);
+    }
+    if (now - watch->windowStart < std::chrono::seconds(10)) return;
+    std::vector<std::pair<std::uint64_t, std::tuple<std::uint64_t, std::uint32_t, std::uint32_t, std::uint64_t>>> top;
+    for (const auto& [key, count] : watch->counts) top.emplace_back(count, key);
+    std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string text;
+    for (std::size_t i = 0; i < std::min<std::size_t>(top.size(), 16); ++i) {
+        const auto& [address, queue, op, val] = top[i].second;
+        char item[112];
+        std::snprintf(item, sizeof(item), " 0x%llx q0x%x op0x%02x =0x%llx x%llu;", static_cast<unsigned long long>(address), queue, op, static_cast<unsigned long long>(val), static_cast<unsigned long long>(top[i].first));
+        text += item;
+    }
+    std::fprintf(stderr, "[label-watch] 10 s: %zu distinct writes in range:%s\n", top.size(), text.c_str());
+    watch->counts.clear();
+    watch->detailed = 0;
+    watch->windowStart = now;
+}
 
 bool orderedFills() {
     static const bool ordered = std::getenv("APS5_PIPELINE_DRAIN_FILLS") == nullptr;
@@ -193,6 +257,7 @@ void Driver::execute(const Submission& submission) {
         if (submission.queue == 0) DrawPipeline::PipeTrace(DrawPipeline::Trace::QueuePacket, header == FlipPacketHeader ? 0x1ffu : opcode);
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
+        if (!predicated) noteWatchedLabel(submission, packet, opcode, cursor);
         if (opcode == 0x37 && !predicated && dispatchRunsHere && Graphics::Recorder::DispatchRunStoresEnabled()) {
             // A WRITE_DATA keeps the run (Recorder::DispatchRunStoresEnabled): its store goes in
             // place inside it.
