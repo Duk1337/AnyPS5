@@ -643,6 +643,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pending.phases = true;
         pending.captures = captures;
         pending.ms = phaseMs;
+        // A preparation worker's draw never reaches the packet loop's addDrawPhases: its phases go
+        // to the thread's totals here, for the [slow-prep] breakdown.
+        if (DrawPipeline::Queue0().OnPrepThread()) {
+            auto& own = ThreadDrawPhaseMs();
+            for (std::size_t i = 0; i < DrawDriverPhaseCount; ++i) own[i] += phaseMs[i];
+        }
         pending.tailAt = phaseLap;
         return DrawVerdict::Drawn;
     };
@@ -971,6 +977,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pending.phases = true;
         pending.captures = captures;
         pending.ms = phaseMs;
+        // A preparation worker's draw never reaches the packet loop's addDrawPhases: its phases go
+        // to the thread's totals here, for the [slow-prep] breakdown.
+        if (DrawPipeline::Queue0().OnPrepThread()) {
+            auto& own = ThreadDrawPhaseMs();
+            for (std::size_t i = 0; i < DrawDriverPhaseCount; ++i) own[i] += phaseMs[i];
+        }
         pending.tailAt = phaseLap;
         return DrawVerdict::Drawn;
     };
