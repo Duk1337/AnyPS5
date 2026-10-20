@@ -2051,7 +2051,15 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
 #endif
     if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return stampStored(tracker, store());
     const auto stored = store();
-    walkWrites(tracker, first, stop, StampKind::Driver);
+    // The walk after the store reports the store's own pages, and also any title write that landed
+    // on those pages since the walk before it (the title's threads write without the tracker lock;
+    // GT7's race load writes mesh data next to label slots the queues store to every millisecond).
+    // Stamped as the driver's, such a write was lost: no CPU note, so a cache or lease mirror could
+    // keep its old copy of the page (the suspected cause of GT7's zeroed mesh adjacency and command
+    // buffers at race load). The pages are stamped as CPU writes; the store's own bytes get the
+    // driver stamp below. APS5_STORE_OWN_DRIVER_WALK=1 restores the driver stamp.
+    static const bool driverWalk = std::getenv("APS5_STORE_OWN_DRIVER_WALK") != nullptr;
+    walkWrites(tracker, first, stop, driverWalk ? StampKind::Driver : StampKind::Cpu);
     return stampStored(tracker, stored);
 }
 
