@@ -1,0 +1,4 @@
+GT7 play setup (prototype driver, best known flags). Two background commands, toggler first:
+  py -I -B live_abba.py proto/runs fork_stats 120 30 0 async_unordered,wait_overlap,plan,parallel_build,fork_build,split_indirect
+  py -I -B <launcher>/baseline.py --config proto/proto.json launch --launch-approved --variant P-play4a
+Get into the race within 2 minutes; the six flags switch on at 2:00 and stay on. Restore the save after exit.json appears.
