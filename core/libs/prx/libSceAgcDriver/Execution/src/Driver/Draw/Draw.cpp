@@ -490,8 +490,13 @@ public:
                 }
             });
             if (firstRefused.load(std::memory_order_relaxed) == 0) {
+                // Live `fork_backoff_short` (env APS5_FORK_BACKOFF_SHORT): a pass whose run head was
+                // refused skips 2 runs instead of 16. In the GT7 race only ~8% of builds are refused,
+                // but the 16-run backoff cut ~9k runs per 10 s, whose draws then took the normal
+                // commit at ~3x the forked cost.
+                static const bool shortDefault = std::getenv("APS5_FORK_BACKOFF_SHORT") != nullptr;
                 if (backoff.size() > 256) backoff.clear();
-                backoff[hint] = 16;
+                backoff[hint] = Graphics::LiveFlag("fork_backoff_short", shortDefault) ? 2 : 16;
             }
             if (timed) {
                 Commits().runs.fetch_add(1, std::memory_order_relaxed);
