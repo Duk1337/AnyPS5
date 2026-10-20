@@ -954,6 +954,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     bool verifyHit = false;
     if (verifyRebasedHits()) RebasedProbes().clear();
     lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates);
+    // An indirect draw whose stages are not all cache hits captures and compiles them below, reading
+    // guest memory the queued draws ahead of it may still write (a hook wait there could wait on work
+    // only the committer records): it takes the drain it skipped first, as before indirect_draw_params.
+    if (indirectDrainPending && !drawHit) {
+        indirectDrainPending = false;
+        if (DrawPipeline::Queue0().OnPrepThread()) DrawPipeline::Queue0().WaitEarlierPreparations();
+        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
+    }
 
     if (registerKey) {
 
