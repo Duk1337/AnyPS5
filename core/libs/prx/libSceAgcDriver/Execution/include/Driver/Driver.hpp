@@ -53,6 +53,20 @@ class ShaderPreparationTransaction;
 struct DrawForkJob;
 class DrawForkRunner;
 
+// Dispatch lock runs (live `dispatch_lock_runs`, env APS5_DISPATCH_LOCK_RUNS): an async compute
+// queue's worker keeps GuestMemory::GpuMutex from one DISPATCH_DIRECT to the next while only
+// SET_SH_REG writes separate them, for up to APS5_DISPATCH_LOCK_RUN_US (default 500) of holding,
+// instead of taking it once per dispatch: the SRW lock is not fair, and a queue issuing thousands of
+// small dispatches waited behind the draw committer's per-draw holds for most of its time. The run's
+// hold is the dispatch's own outermost acquisition (waits that release the mutex around themselves
+// still do). Driver::execute allows runs for a submission and ends one at any other packet, when it
+// is due, and at the submission's end, so no packet that can wait runs inside it.
+void AllowDispatchLockRun(bool allowed);
+bool DispatchLockRunAllowed();
+void EnterDispatchLockRun();
+bool DispatchLockRunDue();
+void EndDispatchLockRun();
+
 class Driver {
 public:
     static Driver& Get();

@@ -43,6 +43,51 @@ void noteDwordFillKernel(std::span<const std::uint32_t> code, const std::vector<
 
 }
 
+namespace {
+
+struct DispatchLockRun {
+    bool allowed = false;
+    bool held = false;
+    std::chrono::steady_clock::time_point since;
+};
+
+thread_local DispatchLockRun dispatchLockRun;
+
+std::chrono::nanoseconds dispatchLockRunCap() {
+    static const auto cap = [] {
+        const char* text = std::getenv("APS5_DISPATCH_LOCK_RUN_US");
+        return std::chrono::nanoseconds(static_cast<std::int64_t>(text != nullptr ? std::strtoull(text, nullptr, 10) : 500ull) * 1000);
+    }();
+    return cap;
+}
+
+}
+
+void AllowDispatchLockRun(bool allowed) {
+    dispatchLockRun.allowed = allowed;
+}
+
+bool DispatchLockRunAllowed() {
+    return dispatchLockRun.allowed;
+}
+
+void EnterDispatchLockRun() {
+    if (dispatchLockRun.held) return;
+    GuestMemory::GpuMutex().lock();
+    dispatchLockRun.held = true;
+    dispatchLockRun.since = std::chrono::steady_clock::now();
+}
+
+bool DispatchLockRunDue() {
+    return dispatchLockRun.held && std::chrono::steady_clock::now() - dispatchLockRun.since >= dispatchLockRunCap();
+}
+
+void EndDispatchLockRun() {
+    if (!dispatchLockRun.held) return;
+    dispatchLockRun.held = false;
+    GuestMemory::GpuMutex().unlock();
+}
+
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     CpuCost::Context diagContext(CpuCost::Work(submission.queue));
     CpuCost::Scope diagPacket(CpuCost::Op::DispatchPacket);
@@ -452,7 +497,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             }
         }
         GuestMemory::TagGpuLockSite(indirectArguments != 0 ? GuestMemory::GpuLockSite::Indirect : GuestMemory::GpuLockSite::Dispatch);
-        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        // A direct dispatch inside a dispatch lock run keeps the run's hold (see Driver.hpp).
+        std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+        if (indirectArguments == 0 && DispatchLockRunAllowed()) EnterDispatchLockRun();
+        else gpuLock.lock();
         phaseTiming.Phase(PhaseLockWait);
 
         recordLabelsForPacket(localDevice.get(), submission.queue);

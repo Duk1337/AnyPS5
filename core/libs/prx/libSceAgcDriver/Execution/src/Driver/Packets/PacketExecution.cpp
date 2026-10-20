@@ -246,6 +246,17 @@ void Driver::execute(const Submission& submission) {
     static const long dispatchRunQueue = [] { const char* text = std::getenv("APS5_DISPATCH_RUN_QUEUE"); return text != nullptr ? std::strtol(text, nullptr, 16) : -1L; }();
     const bool dispatchRunsHere = dispatchRunQueue < 0 || static_cast<long>(submission.queue) == dispatchRunQueue;
     dispatchRunEpoch.fetch_add(1, std::memory_order_relaxed);
+    // Dispatch lock runs (see Driver.hpp) on the async queues; the run ends with the submission,
+    // also when a packet throws.
+    static const bool dispatchLockRunsDefault = std::getenv("APS5_DISPATCH_LOCK_RUNS") != nullptr;
+    const bool dispatchLockRuns = submission.queue != 0 && Graphics::LiveFlag("dispatch_lock_runs", dispatchLockRunsDefault);
+    struct DispatchLockRunScope {
+        explicit DispatchLockRunScope(bool allowed) { AllowDispatchLockRun(allowed); }
+        ~DispatchLockRunScope() {
+            EndDispatchLockRun();
+            AllowDispatchLockRun(false);
+        }
+    } dispatchLockRunScope(dispatchLockRuns);
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
@@ -257,6 +268,7 @@ void Driver::execute(const Submission& submission) {
         if (submission.queue == 0) DrawPipeline::PipeTrace(DrawPipeline::Trace::QueuePacket, header == FlipPacketHeader ? 0x1ffu : opcode);
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
+        if (dispatchLockRuns && (predicated || (opcode != 0x15 && opcode != 0x76) || DispatchLockRunDue())) EndDispatchLockRun();
         if (!predicated) noteWatchedLabel(submission, packet, opcode, cursor);
         if (opcode == 0x37 && !predicated && dispatchRunsHere && Graphics::Recorder::DispatchRunStoresEnabled()) {
             // A WRITE_DATA keeps the run (Recorder::DispatchRunStoresEnabled): its store goes in
