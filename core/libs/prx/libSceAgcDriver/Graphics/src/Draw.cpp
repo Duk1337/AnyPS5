@@ -251,6 +251,8 @@ struct DrawProfile {
     std::mutex mutex;
     std::array<double, KindCount> kindUs{};
     std::array<std::uint64_t, KindCount> kindCounts{};
+    // The phases of each kind (the [draw-kinds] line): which phase makes one kind dearer than another.
+    std::array<std::array<double, PhaseCount>, KindCount> kindPhaseUs{};
     std::uint64_t fullScissorLookups = 0;
     std::uint64_t partialLookups = 0;
     std::uint64_t pagesWalked = 0;
@@ -452,6 +454,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     if (outcome.kind < KindCount) {
         ++profile.kindCounts[outcome.kind];
         profile.kindUs[outcome.kind] += drawUs;
+        for (std::size_t i = 0; i < PhaseCount; ++i) profile.kindPhaseUs[outcome.kind][i] += us[i];
     }
     if (outcome.validateMemoized) ++(outcome.validateHit ? profile.validateHits : profile.validateMisses);
     const auto now = std::chrono::steady_clock::now();
@@ -504,6 +507,21 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     std::fprintf(stderr, "%s\n", line);
+    {
+        char kinds[1536];
+        int k = std::snprintf(kinds, sizeof(kinds), "[draw-kinds] avg us per phase (10 s):");
+        for (std::size_t kind = 0; kind < KindCount; ++kind) {
+            const auto count = profile.kindCounts[kind];
+            if (count == 0 || k <= 0 || static_cast<std::size_t>(k) >= sizeof(kinds)) continue;
+            k += std::snprintf(kinds + k, sizeof(kinds) - static_cast<std::size_t>(k), " %s (%llu):", DrawKindNames[kind], static_cast<unsigned long long>(count));
+            for (std::size_t i = 0; i < PhaseCount && k > 0 && static_cast<std::size_t>(k) < sizeof(kinds); ++i) {
+                const auto avg = profile.kindPhaseUs[kind][i] / static_cast<double>(count);
+                if (avg >= 1.0) k += std::snprintf(kinds + k, sizeof(kinds) - static_cast<std::size_t>(k), " %s %.0f", DrawPhaseNames[i], avg);
+            }
+            if (k > 0 && static_cast<std::size_t>(k) < sizeof(kinds)) k += std::snprintf(kinds + k, sizeof(kinds) - static_cast<std::size_t>(k), ";");
+        }
+        std::fprintf(stderr, "%s\n", kinds);
+    }
     const auto inputMemo = DrawInputMemoCounters();
     if (inputMemo.hits != 0 || inputMemo.misses != 0)
         std::fprintf(stderr, "[draw-input] cumulative memo hits %llu, fallbacks %llu\n", static_cast<unsigned long long>(inputMemo.hits), static_cast<unsigned long long>(inputMemo.misses));
@@ -552,6 +570,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.fullScissorLookups = profile.partialLookups = profile.pagesWalked = 0;
     profile.lookupUs = 0;
     profile.kindUs.fill(0);
+    for (auto& phases : profile.kindPhaseUs) phases.fill(0);
     profile.kindCounts.fill(0);
     profile.cacheHits = profile.cacheMisses = profile.cacheInvalidated = profile.uncacheable = 0;
     profile.streamRefused = profile.streamDropped = 0;
