@@ -744,10 +744,28 @@ int APS5_VABI sceKernelAprGetFileStat(uint32_t id, FileStat* stat) {
 }
 
 int APS5_VABI sceKernelAprSubmitCommandBuffer(const Apr::CommandBufferObject* buffer, uint32_t priority) {
-    (void)priority;
     if (!buffer || buffer->type != Apr::BufferType::Apr) return _fail(GUEST_EINVAL);
     const auto start = _profiling() ? _nowNs() : 0;
+    // The console's APR runs a priority's command buffers one after another in submission order;
+    // executed on the submitting threads they overlapped, so a read could land in a range another
+    // thread's buffer was still mapping or remapping. One submission per priority runs at a time
+    // (on the console a later buffer of the same priority cannot run before an earlier one either,
+    // so an earlier buffer's wait cannot depend on it). APS5_APR_CONCURRENT=1 restores overlapping
+    // execution. The submissions that found another one of their priority running are counted.
+    static const bool concurrent = std::getenv("APS5_APR_CONCURRENT") != nullptr;
+    static std::array<std::mutex, 4> serial;
+    static std::atomic<std::uint64_t> overlapped{0}, reportedAt{0};
+    std::unique_lock order(serial[priority % serial.size()], std::defer_lock);
+    if (!order.try_lock()) {
+        const auto count = overlapped.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count >= reportedAt.load(std::memory_order_relaxed) * 2 + 1) {
+            reportedAt.store(count, std::memory_order_relaxed);
+            std::fprintf(stderr, "[apr] %llu submissions found another of their priority running (%s)\n", static_cast<unsigned long long>(count), concurrent ? "overlapping, APS5_APR_CONCURRENT" : "serialized");
+        }
+        if (!concurrent) order.lock();
+    }
     _execute(*buffer);
+    if (order.owns_lock()) order.unlock();
     if (start != 0) {
         const auto elapsed = _nowNs() - start;
         auto& p = _profile();
