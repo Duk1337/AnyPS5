@@ -657,7 +657,13 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     // APS5_SPLIT_DRAW_FRONT=1: the whole draw runs on a preparation worker from a snapshot of the
     // queue's registers; the queue thread only takes the snapshot.
     static const bool frontSplit = std::getenv("APS5_SPLIT_DRAW_FRONT") != nullptr;
-    if (frontSplit && pipelined && submission.queue == 0 && DrawPipeline::SplitDraws() && !DrawPipeline::Queue0().OnPrepThread() && !drawParameters.indirect && deferredLabels().labels.empty()) {
+    // Live `split_indirect` (env APS5_SPLIT_INDIRECT): indirect draws split like the others. Their
+    // arguments are read from guest memory the queued work may still write, so the worker waits for
+    // its turn and for the committer to finish everything before it, then reads and records the draw
+    // itself; the draws after it wait behind its turn. The queue thread no longer drains for them.
+    static const bool splitIndirectDefault = std::getenv("APS5_SPLIT_INDIRECT") != nullptr;
+    const bool splitIndirect = drawParameters.indirect && Graphics::LiveFlag("split_indirect", splitIndirectDefault);
+    if (frontSplit && pipelined && submission.queue == 0 && DrawPipeline::SplitDraws() && !DrawPipeline::Queue0().OnPrepThread() && (!drawParameters.indirect || splitIndirect) && deferredLabels().labels.empty()) {
         auto snapshot = std::make_shared<QueueState>(queue, QueueState::DrawSnapshot{});
         auto stable = std::make_shared<Submission>();
         stable->serial = submission.serial;
@@ -671,7 +677,13 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         });
         return drawn();
     }
-    if (pipelined && drawParameters.indirect) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
+    if (pipelined && drawParameters.indirect) {
+        // On a preparation worker (split_indirect) the drain waits for the earlier preparations to
+        // hand over first: Drain skips the preparation queue on a worker, and the draws ahead of
+        // this one may still be in it.
+        if (DrawPipeline::Queue0().OnPrepThread()) DrawPipeline::Queue0().WaitEarlierPreparations();
+        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
+    }
     bool traceIndirect = false;
     if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect)) return *verdict;
     phaseTiming.Phase(DrawRowPrecheck);
