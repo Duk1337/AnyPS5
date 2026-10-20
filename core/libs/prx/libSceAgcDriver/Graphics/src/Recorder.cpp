@@ -1560,10 +1560,12 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
 
 namespace {
 // APS5_WRITE_MAP=<file> (diagnostic): who wrote each 64 KiB unit of guest memory and when, rewritten
-// to the file every 10 s. A unit keeps its last 8 events: G a noted GPU write (with the noting site
-// and program), S a driver store, C a page a walk reported CPU-written, W a walk after the driver's
-// own store, I an import-window walk. Only units with both a CPU event and a GPU write or driver
-// store are listed: a write landing over bytes the title stored is what would corrupt them.
+// to the file every 10 s (APS5_WRITE_MAP_SECONDS) and when the driver rejects a submission. A unit
+// keeps its last 8 events: G a noted GPU write (with the noting site and program), S a driver store,
+// C a page a walk reported CPU-written, W a walk after the driver's own store, I an import-window
+// walk, M a guest allocation change (map, unmap, protect) over it. Only units with a CPU event or an
+// allocation change and a GPU write or driver store are listed: a write landing over bytes the title
+// stored, or over memory it mapped again, is what would corrupt them.
 class WriteMap {
 public:
     static void Init() {
@@ -1575,6 +1577,9 @@ public:
         });
     }
     static WriteMap* Get() { return instance.load(std::memory_order_acquire); }
+    static void DumpNow() {
+        if (auto* map = Get()) map->dump();
+    }
 
     void Note(char kind, std::uint64_t begin, std::uint64_t end, const void* site, std::uint64_t program) {
         if (end <= begin) return;
@@ -1586,7 +1591,7 @@ public:
             auto& entry = units[unit];
             entry.events[entry.next++ % entry.events.size()] = {ms, kind, site, program, begin, end};
             if (kind == 'G' || kind == 'S') entry.written = true;
-            else if (kind == 'C') entry.cpu = true;
+            else if (kind == 'C' || kind == 'M') entry.cpu = true;
         };
         // A write over more than 1 GiB names its first and last units only.
         if (last - first > 16384) {
@@ -1619,19 +1624,22 @@ private:
         GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(&WriteMap::Init), &module);
         base = reinterpret_cast<std::uintptr_t>(module);
         GuestMemory::SetWriteMapObserver([](std::uint64_t address, std::size_t bytes, int origin) {
-            static constexpr char kinds[] = {'C', 'W', 'I', 'S'};
-            if (auto* map = Get()) map->Note(kinds[origin & 3], address, address + bytes, nullptr, 0);
+            static constexpr char kinds[] = {'C', 'W', 'I', 'S', 'M'};
+            if (auto* map = Get(); map != nullptr && origin >= 0 && origin < 5) map->Note(kinds[origin], address, address + bytes, nullptr, 0);
         });
         std::fprintf(stderr, "[write-map] on: %s (prx base 0x%llx)\n", this->path.c_str(), static_cast<unsigned long long>(base));
         std::thread([this] {
+            const char* text = std::getenv("APS5_WRITE_MAP_SECONDS");
+            const auto seconds = std::max<unsigned long long>(text != nullptr ? std::strtoull(text, nullptr, 10) : 10ull, 1ull);
             for (;;) {
-                std::this_thread::sleep_for(std::chrono::seconds(10));
+                std::this_thread::sleep_for(std::chrono::seconds(seconds));
                 dump();
             }
         }).detach();
     }
 
     void dump() {
+        std::lock_guard dumping(dumpMutex);
         struct Listed {
             std::uint64_t unit;
             Unit entry;
@@ -1670,6 +1678,7 @@ private:
     }
 
     static inline std::atomic<WriteMap*> instance{nullptr};
+    std::mutex dumpMutex;
     std::string path;
     std::chrono::steady_clock::time_point start;
     std::uintptr_t base = 0;
@@ -1827,6 +1836,10 @@ std::uint64_t Recorder::RecordedWorkSinceSubmit() {
 
 void Recorder::CountRecordedWork() {
     workSinceSubmit[CurrentSlot()].fetch_add(1, std::memory_order_relaxed);
+}
+
+void DumpWriteMapNow() {
+    WriteMap::DumpNow();
 }
 
 Recorder* Recorder::Active() {

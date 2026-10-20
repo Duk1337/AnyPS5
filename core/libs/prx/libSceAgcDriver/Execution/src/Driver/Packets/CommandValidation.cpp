@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include <cstdlib>
 #include <stdexcept>
 
@@ -27,6 +28,7 @@ void Driver::dumpPackets(std::span<const std::uint32_t> commands, const std::uin
         cursor += count;
     }
     std::fprintf(stderr, "[gpu] rejected submission of %zu dwords at guest %p:\n", commands.size(), static_cast<const void*>(guest));
+    Graphics::DumpWriteMapNow();
     for (const auto& [name, entry] : summary) std::fprintf(stderr, "[gpu]   %-28s x%-5zu %s\n", name.c_str(), entry.first, entry.second.c_str());
 
     for (std::size_t i = walk.size() > 24 ? walk.size() - 24 : 0; i < walk.size(); ++i) {

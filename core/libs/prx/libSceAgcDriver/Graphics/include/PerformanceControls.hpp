@@ -49,6 +49,8 @@ PerformanceControls& LivePerformanceControls();
 
 bool LiveFlag(std::string_view name, bool fallback);
 bool ForkStatsEnabled();
+// APS5_WRITE_MAP: rewrites the write map file now (a rejected submission, before the title fails).
+void DumpWriteMapNow();
 bool ForkLogEnabled();
 bool ForkBuildEnabled();
 bool ForkAheadEnabled();

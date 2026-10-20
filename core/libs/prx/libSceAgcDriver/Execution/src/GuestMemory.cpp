@@ -502,6 +502,8 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
     forgetSerial.fetch_add(1, std::memory_order_release);
     Pages().forget(address, bytes);
     forgetSerial.fetch_add(1, std::memory_order_release);
+    // APS5_WRITE_MAP: the allocation change, as an M event over the range.
+    if (const auto map = writeMapObserver.load(std::memory_order_acquire)) map(address, bytes, 4);
 }
 
 void PageStates::initialize() {
