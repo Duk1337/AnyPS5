@@ -43,6 +43,8 @@ enum class StageInputKind {
     DispatchThreadLimit,
     Parameter,
     HelperInvocation,
+    BaseVertex,
+    BaseInstance,
 };
 
 enum class StageOutputKind {

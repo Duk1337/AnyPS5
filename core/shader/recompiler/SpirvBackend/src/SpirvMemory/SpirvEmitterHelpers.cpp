@@ -64,6 +64,8 @@ std::uint32_t BuiltInForInput(StageInputKind kind) {
     case StageInputKind::PrimitiveId: return spv::BuiltInPrimitiveId;
     case StageInputKind::TessCoord: return spv::BuiltInTessCoord;
     case StageInputKind::InstanceIndex: return spv::BuiltInInstanceIndex;
+    case StageInputKind::BaseVertex: return spv::BuiltInBaseVertex;
+    case StageInputKind::BaseInstance: return spv::BuiltInBaseInstance;
     case StageInputKind::FragCoord: return spv::BuiltInFragCoord;
     case StageInputKind::FrontFacing: return spv::BuiltInFrontFacing;
     case StageInputKind::HelperInvocation: return spv::BuiltInHelperInvocation;
@@ -195,6 +197,12 @@ void DefineInputs(SpirvEmitterState& state) {
         case StageInputKind::InstanceIndex:
         case StageInputKind::Layer:
         case StageInputKind::SampleId:
+            type = TypeI32(state);
+            break;
+        case StageInputKind::BaseVertex:
+        case StageInputKind::BaseInstance:
+            // Core in SPIR-V 1.3; the device enables shaderDrawParameters.
+            state.module.EmitCapability(spv::CapabilityDrawParameters);
             type = TypeI32(state);
             break;
         case StageInputKind::WorkgroupId:

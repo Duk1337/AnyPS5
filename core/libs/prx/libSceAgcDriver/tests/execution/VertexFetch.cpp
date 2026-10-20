@@ -111,6 +111,54 @@ void Run(AgcDriver::VulkanDevice& device) {
             Require(pixels[index] == std::byte{255} && pixels[index + 1u] == std::byte{0} && pixels[index + 2u] == std::byte{0} && pixels[index + 3u] == std::byte{255}, "runtime vertex fetch produced the wrong triangle");
         }
     }
+
+    // An indirect draw's variant: s2 is the SGPR the CP writes with the record's base vertex, so the
+    // prologue loads it from BaseVertex (the draw's first vertex here) and the stale user word is
+    // ignored. The variant enters the cache key: it must not reuse the artifact above.
+    {
+        constexpr std::uint32_t staleOffset = 5u;
+        userData[2] = staleOffset;
+        request.context.vertex->baseVertexSgpr = 2;
+        vertices.fill(std::byte{0});
+        // Fetch index = VertexIndex (first vertex 1 + i) + BaseVertex (1) + s8 (1) + s3 (1).
+        constexpr std::uint32_t firstRecord = 4u;
+        for (std::size_t index = 0; index < positions.size(); ++index) std::memcpy(vertices.data() + (firstRecord + index) * 16u, positions[index].data(), 16u);
+        const auto address = reinterpret_cast<std::uintptr_t>(vertices.data());
+        descriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) | (16u << 16u), 8u, 0x01000facu | (77u << 12u)};
+        request.context.vertex->resources[0].fields = descriptor;
+        const auto vertex = ShaderRecompiler::Recompile(request);
+        Require(vertex.variantId != first.variantId, "the base vertex variant reused the plain artifact");
+        const auto pushBytes = static_cast<std::uint32_t>(vertex.pushConstants.size());
+        ShaderRecompiler::ShaderPixelStageInfo pixelInfo{};
+        pixelInfo.wave32 = true;
+        pixelInfo.targetOutputMode[0] = 9u;
+        pixelInfo.targetExportMapping.fill(0xe4u);
+        ShaderRecompiler::RecompileRequest pixelRequest{{ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(pixelCode.data()), pixelCode, 0, {}}, {32u, 0u, {}, std::nullopt, pixelInfo, std::nullopt, {}}, device.Target(), {0u, 0u, pushBytes, 128u - pushBytes}};
+        const auto pixel = ShaderRecompiler::Recompile(pixelRequest);
+        const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderStage::Vertex, &vertex, 0u}, {ShaderStage::Fragment, &pixel, pushBytes}}};
+        AgcDriver::Graphics::State state{};
+        state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, 32u, 32u, std::nullopt, std::nullopt};
+        state.color = {reinterpret_cast<std::uintptr_t>(pixels.data()), {Extent, Extent}, VK_FORMAT_R8G8B8A8_UNORM, pixels.size(), 0xe4u};
+        state.colors = {state.color};
+        state.hasColorTarget = true;
+        state.renderExtent = {Extent, Extent};
+        state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        state.viewport = {0.0f, static_cast<float>(Extent), static_cast<float>(Extent), -static_cast<float>(Extent), 0.0f, 1.0f};
+        state.scissor = {{0, 0}, {Extent, Extent}};
+        state.cullMode = VK_CULL_MODE_NONE;
+        state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        state.blend.colorWriteMask = 15u;
+        state.blends = {state.blend};
+        AgcDriver::Pm4::DrawParameters draw{0u, 3u, 0u, 1u, 0u, false};
+        draw.firstVertex = 1u;
+        draw.firstInstance = 1u;
+        pixels.fill(std::byte{0});
+        device.Draw(state, draw, shaders);
+        device.WaitIdle();
+        for (std::size_t index = 0; index < pixels.size(); index += 4u) {
+            Require(pixels[index] == std::byte{255} && pixels[index + 1u] == std::byte{0} && pixels[index + 2u] == std::byte{0} && pixels[index + 3u] == std::byte{255}, "the base vertex variant read the stale user word");
+        }
+    }
 }
 
 }

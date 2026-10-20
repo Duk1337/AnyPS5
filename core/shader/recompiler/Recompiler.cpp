@@ -163,6 +163,10 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
     translateOptions.scratchDwords = request.context.compute.has_value() ? request.context.compute->scratchDwords : 0u;
     translateOptions.fragmentShaderBarycentricEnabled = request.target.fragmentShaderBarycentricEnabled;
     translateOptions.inputInfo = inputInfo;
+    if (stageKind == ShaderStageKind::Vertex && request.context.vertex) {
+        translateOptions.baseVertexSgpr = request.context.vertex->baseVertexSgpr;
+        translateOptions.baseInstanceSgpr = request.context.vertex->baseInstanceSgpr;
+    }
 
     constexpr InstructionTranslator translator;
 

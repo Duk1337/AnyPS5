@@ -682,7 +682,21 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         });
         return drawn();
     }
-    if (pipelined && drawParameters.indirect) {
+    // Live `indirect_draw_params` (env APS5_INDIRECT_DRAW_PARAMS): the vertex stage of an indirect
+    // draw is compiled with the SGPRs the CP writes (base vertex, start instance) loaded from the
+    // host's BaseVertex / BaseInstance, which a GPU-side indirect draw sets from the same records. Its
+    // other reads of those SGPRs then no longer need the records on the CPU (IndirectDrawPath
+    // "patched SGPR not folded": a drain, a CPU read and a rebuilt stage per draw). The variant enters
+    // the stage's cache keys and the draw key, so draws with and without it never share entries.
+    // With the flag the drain below waits until the draw turns out to read its records on the CPU or
+    // to record synchronously (drainIndirect in the tail); a GPU-side draw is committed in order like
+    // any other pipelined draw.
+    static const bool indirectDrawParamsDefault = std::getenv("APS5_INDIRECT_DRAW_PARAMS") != nullptr;
+    const bool indirectDrawParamsFlag = drawParameters.indirect && Graphics::LiveFlag("indirect_draw_params", indirectDrawParamsDefault);
+    // APS5_LOCKED_DRAW_PREPARE holds the GPU mutex through the tail, where a drain would wait on itself.
+    static const bool lockedPrepareEnv = std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr;
+    bool indirectDrainPending = pipelined && indirectDrawParamsFlag && !lockedPrepareEnv;
+    if (pipelined && drawParameters.indirect && !indirectDrainPending) {
         // On a preparation worker (split_indirect) the drain waits for the earlier preparations to
         // hand over first: Drain skips the preparation queue on a worker, and the draws ahead of
         // this one may still be in it.
@@ -722,6 +736,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("device_setup");
     phaseTiming.Phase(DrawRowVectors);
 
+    const bool indirectDrawParameters = indirectDrawParamsFlag && localDevice->DrawIndirectSupport().drawParameters;
     const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
     const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::uint64_t drawKey = 0;
@@ -732,6 +747,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey);
+        if (indirectDrawParameters) {
+            drawKey ^= 0xd7a3000000000000ull ^ (static_cast<std::uint64_t>(drawParameters.indirect->baseVertexLocation) << 16u) ^ drawParameters.indirect->startInstanceLocation;
+            drawKey *= 0x100000001b3ull;
+        }
         std::lock_guard cacheLock(drawCacheMutex);
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
@@ -879,6 +898,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         indirect.startInstanceSgpr = sgprOf(indirect.startInstanceLocation);
         indirect.drawIndexSgpr = sgprOf(indirect.drawIndexLocation);
     }
+    std::int32_t drawBaseVertexSgpr = -1, drawBaseInstanceSgpr = -1;
+    if (indirectDrawParameters && graphics.stages.path == Graphics::ShaderPath::Vertex && !graphics.rectList && !graphics.stages.mesh && !graphics.stages.tessellation) {
+        drawBaseVertexSgpr = drawParameters.indirect->baseVertexSgpr;
+        drawBaseInstanceSgpr = drawParameters.indirect->startInstanceSgpr;
+    }
     std::vector<ShaderRecompiler::MemoryRegion> memory;
     std::vector<ShaderRecompiler::LinkedProgram> linked;
     for (std::size_t i = 0; i < programs.size(); ++i) {
@@ -897,6 +921,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         decodeReads[i].clear();
         vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i]);
         if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = (readRegister(queue.context, 0x207) & (0xffffu | (1u << 21u) | (1u << 22u) | (1u << 23u))) | graphics.layerExports;
+        if (vertexInfos[i] && i == 0) {
+            vertexInfos[i]->baseVertexSgpr = drawBaseVertexSgpr;
+            vertexInfos[i]->baseInstanceSgpr = drawBaseInstanceSgpr;
+        }
     };
     if (!registerKey) {
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
@@ -974,10 +1002,18 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     stableSubmission->shaders = submission.shaders;
     stableSubmission->received = submission.received;
     auto packetWords = std::make_shared<const std::vector<std::uint32_t>>(packet.begin(), packet.end());
-    auto tail = [diagOrigin=CpuCost::Capture(), this, &queue, stableSubmission, packetWords, clipControl, rejectedOut, splitRejected, splitDraw, splitEpoch, phaseMsIn = phaseMs, phaseLapIn = phaseLap, capturesIn = captures, drawParameters, pipelined, traceIndirect, gpuLock = std::move(gpuLock), localDevice, useDrawEntries, registerKey, drawKey, entry = std::move(entry), decode = std::move(decode), dataEntry = std::move(dataEntry), shapeKey, programs = std::move(programs), memory = std::move(memory), linked = std::move(linked), vertexInfos = std::move(vertexInfos), decodeReads = std::move(decodeReads), results = std::move(results), compiledStages = std::move(compiledStages), stages = std::move(stages), pushCursorBytes, programResults = std::move(programResults), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), recompiled = std::move(recompiled), dataCandidates = std::move(dataCandidates), reused = std::move(reused), dataStagesReused, dataStagesCompiled, dataVerified, drawHit, verifyHit]() mutable -> DrawVerdict {
+    auto tail = [diagOrigin=CpuCost::Capture(), this, &queue, stableSubmission, packetWords, clipControl, rejectedOut, splitRejected, splitDraw, splitEpoch, phaseMsIn = phaseMs, phaseLapIn = phaseLap, capturesIn = captures, drawParameters, pipelined, traceIndirect, drawBaseVertexSgpr, drawBaseInstanceSgpr, indirectDrainPending, gpuLock = std::move(gpuLock), localDevice, useDrawEntries, registerKey, drawKey, entry = std::move(entry), decode = std::move(decode), dataEntry = std::move(dataEntry), shapeKey, programs = std::move(programs), memory = std::move(memory), linked = std::move(linked), vertexInfos = std::move(vertexInfos), decodeReads = std::move(decodeReads), results = std::move(results), compiledStages = std::move(compiledStages), stages = std::move(stages), pushCursorBytes, programResults = std::move(programResults), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), recompiled = std::move(recompiled), dataCandidates = std::move(dataCandidates), reused = std::move(reused), dataStagesReused, dataStagesCompiled, dataVerified, drawHit, verifyHit]() mutable -> DrawVerdict {
     CpuCost::Context diagContext(diagOrigin);
     if (splitDraw) DrawPipeline::FollowEpoch(splitEpoch);
     const Submission& submission = *stableSubmission;
+    // The drain an indirect draw skipped (indirect_draw_params), taken before it reads its records on
+    // the CPU or records synchronously, as the early drain would have.
+    const auto drainIndirect = [&indirectDrainPending] {
+        if (!indirectDrainPending) return;
+        indirectDrainPending = false;
+        if (DrawPipeline::Queue0().OnPrepThread()) DrawPipeline::Queue0().WaitEarlierPreparations();
+        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
+    };
     const std::span<const std::uint32_t> packet(*packetWords);
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
@@ -1028,6 +1064,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         decodeReads[i].clear();
         vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i]);
         if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = (clipControl & (0xffffu | (1u << 21u) | (1u << 22u) | (1u << 23u))) | graphics.layerExports;
+        if (vertexInfos[i] && i == 0) {
+            vertexInfos[i]->baseVertexSgpr = drawBaseVertexSgpr;
+            vertexInfos[i]->baseInstanceSgpr = drawBaseInstanceSgpr;
+        }
     };
     ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
     static_cast<void>(setMeshIndexBuffer);
@@ -1283,6 +1323,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
             programResults[i] = &results[resultIndex[i]];
         }
+        drainIndirect();
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
         const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
@@ -1362,7 +1403,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             return DrawVerdict::Rejected;
         }
     }
-    if (pipelined && !drawParameters.indirect && deferredLabels().labels.empty()) {
+    if (pipelined && (!drawParameters.indirect || indirectDrainPending) && deferredLabels().labels.empty()) {
         static const bool windowRegistered = [] {
             Graphics::SetAppliedWindow({[] { return DrawPipeline::Queue0().AppliedFrontier(); }, [](std::uint64_t fromExclusive, std::span<const std::pair<std::uint64_t, std::uint64_t>> reads) {
                 return static_cast<Graphics::WindowVerdict>(DrawPipeline::Queue0().CheckWindow(fromExclusive, DrawPipeline::CommittingSequence(), reads));
@@ -1410,7 +1451,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             for (const auto& color : graphics.colors) prefetchTarget(color);
         }
         std::shared_ptr<Graphics::DrawSpeculation> speculation;
-        if (recipe == nullptr && Graphics::DrawSpeculationEnabled() && DrawPipeline::Queue0().OnPrepThread()) {
+        if (recipe == nullptr && !drawParameters.indirect && Graphics::DrawSpeculationEnabled() && DrawPipeline::Queue0().OnPrepThread()) {
             try {
                 speculation = localDevice->SpeculateDraw(graphics, drawParameters, stages, snapshots);
             } catch (...) {
@@ -1418,7 +1459,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
         }
         std::shared_ptr<Graphics::DrawPrebuild> prebuilt;
-        if (recipe == nullptr && Graphics::ParallelDrawBuild() && Graphics::DrawPlansEnabled() && DrawPipeline::Queue0().OnPrepThread()) prebuilt = localDevice->PrebuildDraw(graphics, drawParameters, stages, speculation == nullptr);
+        if (recipe == nullptr && !drawParameters.indirect && Graphics::ParallelDrawBuild() && Graphics::DrawPlansEnabled() && DrawPipeline::Queue0().OnPrepThread()) prebuilt = localDevice->PrebuildDraw(graphics, drawParameters, stages, speculation == nullptr);
         static const bool runnerRegistered = [this] {
             DrawPipeline::SetForkRunner(new DrawForkRunner(*this));
             return true;
@@ -1487,6 +1528,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         timing.Mark("draw_enqueued");
         return drawn();
     }
+    drainIndirect();
     lockForDraw();
     noteDrawWriters(stages, submission.queue);
     phaseTiming.Phase(DrawRowVectors);

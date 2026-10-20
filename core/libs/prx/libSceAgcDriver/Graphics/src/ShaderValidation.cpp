@@ -121,7 +121,7 @@ struct Module {
         }
         const auto signature = Signature(type);
         if (vertex && storage == spv::StorageClassInput) {
-            Require((value == spv::BuiltInVertexIndex || value == spv::BuiltInInstanceIndex) && signature == "i32", "unsupported vertex built-in input");
+            Require((value == spv::BuiltInVertexIndex || value == spv::BuiltInInstanceIndex || value == spv::BuiltInBaseVertex || value == spv::BuiltInBaseInstance) && signature == "i32", "unsupported vertex built-in input");
         } else if (vertex && storage == spv::StorageClassOutput) {
             if (value == spv::BuiltInClipDistance || value == spv::BuiltInCullDistance) {
                 Require(signature.starts_with("f32[") && signature.size() == 6 && signature[4] >= '1' && signature[4] <= '8', "unsupported vertex clip or cull distance output");
@@ -235,6 +235,9 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                     (fragment && geometryShader && capability == spv::CapabilityGeometry) ||
                     (fragment && sampleRateShading && capability == spv::CapabilitySampleRateShading) ||
                     (vertex && (capability == spv::CapabilityClipDistance || capability == spv::CapabilityCullDistance)) ||
+                    // BaseVertex / BaseInstance of an indirect draw's vertex variant, requested only when the
+                    // device enabled shaderDrawParameters (VulkanDevice::DrawIndirectSupport).
+                    (vertex && capability == spv::CapabilityDrawParameters) ||
                     capability == spv::CapabilityImageMSArray ||
                     capability == spv::CapabilityStorageImageMultisample ||
                     capability == spv::CapabilityStorageImageWriteWithoutFormat ||

@@ -353,6 +353,10 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         }
         entryIr.SetVectorReg(static_cast<VectorReg>(5), builtin(StageInputKind::VertexIndex));
         entryIr.SetVectorReg(static_cast<VectorReg>(8), builtin(StageInputKind::InstanceIndex));
+        // An indirect draw's CP writes the record's base vertex and start instance into these user
+        // SGPRs at wave launch; the host's draw parameters hold the same values.
+        if (options.baseVertexSgpr >= 0) entryIr.SetScalarReg(static_cast<ScalarReg>(options.baseVertexSgpr), builtin(StageInputKind::BaseVertex));
+        if (options.baseInstanceSgpr >= 0) entryIr.SetScalarReg(static_cast<ScalarReg>(options.baseInstanceSgpr), builtin(StageInputKind::BaseInstance));
     }
 }
 
@@ -392,6 +396,10 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
         program.Info().instanceOffsetShared = options.embeddedFetch->instanceOffsetShared;
         program.Info().vertexOffsetConflict = options.embeddedFetch->vertexOffsetConflict;
         program.Info().instanceOffsetConflict = options.embeddedFetch->instanceOffsetConflict;
+        // An offset SGPR loaded from the draw parameters is no longer a user word the driver has to
+        // patch for its other reads, so the indirect draw can stay on the GPU.
+        if (options.baseVertexSgpr >= 0 && options.baseVertexSgpr == program.Info().vertexOffsetSgpr) program.Info().vertexOffsetShared = false;
+        if (options.baseInstanceSgpr >= 0 && options.baseInstanceSgpr == program.Info().instanceOffsetSgpr) program.Info().instanceOffsetShared = false;
     }
     program.Metadata().cfgFailureKind = cfg.failureKind;
     program.Metadata().failureReason = cfg.unsupportedReason;

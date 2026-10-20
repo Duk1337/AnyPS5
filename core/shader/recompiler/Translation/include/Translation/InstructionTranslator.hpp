@@ -33,6 +33,9 @@ struct TranslateOptions {
     bool fragmentShaderBarycentricEnabled = false;
     ShaderStageInputInfo inputInfo;
     const EmbeddedFetchPlan* embeddedFetch = nullptr;
+    // Vertex stage of an indirect draw: SGPRs set from BaseVertex / BaseInstance (ShaderVertexStageInfo).
+    std::int32_t baseVertexSgpr = -1;
+    std::int32_t baseInstanceSgpr = -1;
 };
 
 class InstructionTranslator {

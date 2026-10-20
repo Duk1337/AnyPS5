@@ -175,6 +175,11 @@ struct ShaderVertexStageInfo {
     std::uint32_t fetchBufferReg;
     bool fetchEmbedded;
     std::uint32_t paClVsOutCntl = 0;
+    // Indirect draws only: the SGPRs the CP writes with the record's base vertex and start instance
+    // at wave launch (-1: none). The vertex prologue then loads them from BaseVertex and BaseInstance,
+    // so every read sees the record's value without a CPU read of the records.
+    std::int32_t baseVertexSgpr = -1;
+    std::int32_t baseInstanceSgpr = -1;
 };
 
 struct GuestContext {

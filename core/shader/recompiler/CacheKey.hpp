@@ -204,6 +204,12 @@ private:
             if (value.fetchEmbedded) destination.fetchIndex = 0;
             append(key, destination);
         }
+        // Appended only when set, so the keys of every other vertex stage stay as they were.
+        if (value.baseVertexSgpr >= 0 || value.baseInstanceSgpr >= 0) {
+            append(key, 0xd7a3u);
+            append(key, value.baseVertexSgpr);
+            append(key, value.baseInstanceSgpr);
+        }
     }
 
     static void append(std::vector<std::uint64_t>& key, const MeshTargetLimits& value) {
